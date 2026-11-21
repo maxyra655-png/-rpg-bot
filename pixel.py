@@ -2282,7 +2282,7 @@ async def cb_fam_in(callback: CallbackQuery):
         await callback.answer("Вы не в семье", show_alert=True)
         return
     amount = int(callback.data.split(":", 1)[1])
-      if p["money"] < amount:
+    if p["money"] < amount:
         await callback.answer(f"Не хватает {amount} ₽ наличными!", show_alert=True)
         return
     p["money"] -= amount
@@ -2290,6 +2290,7 @@ async def cb_fam_in(callback: CallbackQuery):
     save_state()
     await callback.answer(f"Внесено +{amount} ₽ в общак семьи!", show_alert=True)
     await cb_family(callback)
+
 
 
 @dp.callback_query(F.data == "m_shop")
