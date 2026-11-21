@@ -197,6 +197,11 @@ class GameStates(StatesGroup):
     waiting_set_leader = State()
     waiting_leader_bonus = State()
     waiting_leader_kick = State()
+    waiting_broadcast = State()
+    waiting_set_level = State()
+    waiting_give_item = State()
+    waiting_set_faction = State()
+    waiting_reset_confirm = State()
 
 
 def is_owner(tg_id: int) -> bool:
@@ -370,15 +375,24 @@ def back_keyboard() -> InlineKeyboardMarkup:
 def admin_keyboard(tg_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
+            InlineKeyboardButton(text="📢 Объявление всем", callback_data="adm_broadcast"),
             InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats"),
+        ],
+        [
             InlineKeyboardButton(text="💰 Выдать монеты", callback_data="adm_give_coins"),
-        ],
-        [
             InlineKeyboardButton(text="❤️ Выдать HP", callback_data="adm_give_hp"),
-            InlineKeyboardButton(text="🆔 Сменить ID", callback_data="adm_set_id"),
         ],
         [
+            InlineKeyboardButton(text="⭐ Задать уровень", callback_data="adm_set_level"),
+            InlineKeyboardButton(text="🎒 Выдать предмет", callback_data="adm_give_item"),
+        ],
+        [
+            InlineKeyboardButton(text="🏴 Фракция игроку", callback_data="adm_set_faction"),
             InlineKeyboardButton(text="👑 Лидер фракции", callback_data="adm_set_leader"),
+        ],
+        [
+            InlineKeyboardButton(text="🆔 Сменить ID", callback_data="adm_set_id"),
+            InlineKeyboardButton(text="🔄 Сброс игрока", callback_data="adm_reset_user"),
         ],
     ]
     if is_owner(tg_id):
@@ -578,10 +592,47 @@ def build_faction_text(user: dict) -> str:
 
 @dp.callback_query(F.data == "menu_faction")
 async def on_menu_faction(callback: CallbackQuery):
-    uid = callback.from_user.id
-    user = get_user(uid, callback.from_user.first_name)
-    await safe_edit_or_send(callback, build_faction_text(user), faction_keyboard(user))
-    await callback.answer()
+  uid = callback.from_user.id
+  user = get_user(uid, callback.from_user.first_name)
+  await safe_edit_or_send(
+      callback, build_faction_text(user), faction_keyboard(user)
+  )
+  await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("set_faction_"))
+async def on_set_faction(callback: CallbackQuery):
+  uid = callback.from_user.id
+  user = get_user(uid, callback.from_user.first_name)
+  fac_key = callback.data.removeprefix("set_faction_")
+  fac = FACTIONS.get(fac_key)
+  if not fac:
+    await callback.answer("Фракция не найдена", show_alert=True)
+    return
+
+  old_fac = user.get("faction")
+  if old_fac == fac_key:
+    await callback.answer("Ты уже состоишь в этой фракции!", show_alert=True)
+    return
+
+  if old_fac and faction_leaders.get(old_fac) == user["game_id"]:
+    del faction_leaders[old_fac]
+
+  user["faction"] = fac_key
+  max_hp = get_max_hp(user)
+  if fac["hp_bonus"] > 0:
+    user["hp"] = min(max_hp, user.get("hp", MAX_HP) + fac["hp_bonus"])
+  else:
+    user["hp"] = min(max_hp, user.get("hp", MAX_HP))
+
+  save_data()
+  await safe_edit_or_send(
+      callback,
+      f"✅ Ты вступил во фракцию **{fac['name']}**!\n\n"
+      + build_faction_text(user),
+      faction_keyboard(user),
+  )
+  await callback.answer("Фракция выбрана!")
 
 
 @dp.callback_query(F.data == "leave_faction")
@@ -781,6 +832,51 @@ async def on_adm_cancel(callback: CallbackQuery, state: FSMContext):
   await callback.answer("Отменено")
 
 
+@dp.callback_query(F.data == "adm_broadcast")
+async def on_adm_broadcast(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+  await state.set_state(GameStates.waiting_broadcast)
+  await callback.message.answer(
+      "📢 Напиши текст объявления, который отправится **всем** игрокам бота\n"
+      "(или нажми *Отмена ввода* в админ-панели):",
+      parse_mode="Markdown",
+  )
+  await callback.answer()
+
+
+@dp.message(GameStates.waiting_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  text_body = (message.text or "").strip()
+  if not text_body:
+    await message.answer("⚠️ Текст объявления не может быть пустым.")
+    return
+
+  await state.clear()
+  broadcast_text = f"📢 **Объявление от администрации:**\n\n{text_body}"
+  sent_count = 0
+  failed_count = 0
+
+  for tg_id in list(users.keys()):
+    try:
+      await bot.send_message(tg_id, broadcast_text, parse_mode="Markdown")
+      sent_count += 1
+      await asyncio.sleep(0.05)
+    except Exception:
+      failed_count += 1
+
+  await message.answer(
+      f"✅ Рассылка завершена.\n"
+      f"📨 Доставлено: **{sent_count}** | ⚠️ Ошибок: **{failed_count}**",
+      reply_markup=admin_keyboard(message.from_user.id),
+      parse_mode="Markdown",
+  )
+
+
 @dp.callback_query(F.data == "adm_stats")
 async def on_adm_stats(callback: CallbackQuery):
   uid = callback.from_user.id
@@ -800,8 +896,8 @@ async def on_adm_stats(callback: CallbackQuery):
   )
   players_preview = (
       "\n".join(
-          f"• `{u['game_id']}` — {u['name']} (💰 {u.get('coins', 0)}, ❤️"
-          f" {u.get('hp', get_max_hp(u))})"
+          f"• `{u['game_id']}` — {u['name']} (Ур. {u.get('level', 1)}, 💰"
+          f" {u.get('coins', 0)}, ❤️ {u.get('hp', get_max_hp(u))})"
           for u in list(users.values())[:10]
       )
       or "нет игроков"
@@ -816,6 +912,218 @@ async def on_adm_stats(callback: CallbackQuery):
   )
   await safe_edit_or_send(callback, text, admin_keyboard(uid))
   await callback.answer()
+
+
+@dp.callback_query(F.data == "adm_set_level")
+async def on_adm_set_level(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+  await state.set_state(GameStates.waiting_set_level)
+  await callback.message.answer(
+      "⭐ Отправь: `ИГРОВОЙ_ID УРОВЕНЬ`\nПример: `1001 5`",
+      parse_mode="Markdown",
+  )
+  await callback.answer()
+
+
+@dp.message(GameStates.waiting_set_level)
+async def process_set_level(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  parts = (message.text or "").strip().split()
+  if len(parts) != 2:
+    await message.answer(
+        "⚠️ Формат: `ИГРОВОЙ_ID УРОВЕНЬ`.", parse_mode="Markdown"
+    )
+    return
+  try:
+    gid = int(parts[0])
+    new_lvl = int(parts[1])
+  except ValueError:
+    await message.answer(
+        "⚠️ ID и уровень должны быть целыми числами.", parse_mode="Markdown"
+    )
+    return
+
+  if new_lvl < 1 or new_lvl > 999:
+    await message.answer(
+        "⚠️ Уровень должен быть от `1` до `999`.", parse_mode="Markdown"
+    )
+    return
+
+  target = get_user_by_game_id(gid)
+  if not target:
+    await message.answer(
+        f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
+    )
+    return
+
+  target["level"] = new_lvl
+  target["xp"] = 0
+  target["hp"] = get_max_hp(target)
+  save_data()
+  await state.clear()
+  await message.answer(
+      f"✅ Игроку `{gid}` (**{target['name']}**) установлен уровень"
+      f" **{new_lvl}** (HP восстановлено).",
+      reply_markup=admin_keyboard(message.from_user.id),
+      parse_mode="Markdown",
+  )
+
+
+@dp.callback_query(F.data == "adm_give_item")
+async def on_adm_give_item(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+  await state.set_state(GameStates.waiting_give_item)
+  await callback.message.answer(
+      "🎒 Отправь: `ИГРОВОЙ_ID КОД_ПРЕДМЕТА`\n"
+      "Коды: `medkit` (аптечка), `amulet` (амулет +5), `blade` (клинок +12)\n"
+      "Пример: `1001 blade`",
+      parse_mode="Markdown",
+  )
+  await callback.answer()
+
+
+@dp.message(GameStates.waiting_give_item)
+async def process_give_item(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  parts = (message.text or "").strip().split()
+  if len(parts) != 2:
+    await message.answer(
+        "⚠️ Формат: `ИГРОВОЙ_ID КОД_ПРЕДМЕТА`.", parse_mode="Markdown"
+    )
+    return
+  try:
+    gid = int(parts[0])
+  except ValueError:
+    await message.answer(
+        "⚠️ Игровой ID должен быть целым числом.", parse_mode="Markdown"
+    )
+    return
+
+  item_key = parts[1].lower()
+  item = SHOP_ITEMS.get(item_key)
+  if not item:
+    await message.answer(
+        "⚠️ Неверный код предмета. Доступны: `medkit`, `amulet`, `blade`.",
+        parse_mode="Markdown",
+    )
+    return
+
+  target = get_user_by_game_id(gid)
+  if not target:
+    await message.answer(
+        f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
+    )
+    return
+
+  max_hp = get_max_hp(target)
+  extra_info = ""
+  if "hp" in item:
+    target["hp"] = min(max_hp, target.get("hp", max_hp) + item["hp"])
+    extra_info = f" (HP: {target['hp']}/{max_hp})"
+  elif "bonus" in item:
+    target["power_bonus"] = target.get("power_bonus", 0) + item["bonus"]
+    target.setdefault("items", []).append(item["name"])
+    extra_info = f" (бонус силы: +{target['power_bonus']})"
+
+  save_data()
+  await state.clear()
+  await message.answer(
+      f"✅ Игроку `{gid}` (**{target['name']}**) выдан **{item['name']}**{extra_info}.",
+      reply_markup=admin_keyboard(message.from_user.id),
+      parse_mode="Markdown",
+  )
+
+
+@dp.callback_query(F.data == "adm_set_faction")
+async def on_adm_set_faction(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+  await state.set_state(GameStates.waiting_set_faction)
+  await callback.message.answer(
+      "🏴 Отправь: `ИГРОВОЙ_ID ФРАКЦИЯ`\n"
+      "Фракции: `guards`, `seekers`, `bastion` или `none` (снять)\n"
+      "Пример: `1001 seekers`",
+      parse_mode="Markdown",
+  )
+  await callback.answer()
+
+
+@dp.message(GameStates.waiting_set_faction)
+async def process_set_faction_admin(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  parts = (message.text or "").strip().split()
+  if len(parts) != 2:
+    await message.answer(
+        "⚠️ Формат: `ИГРОВОЙ_ID ФРАКЦИЯ`.", parse_mode="Markdown"
+    )
+    return
+  try:
+    gid = int(parts[0])
+  except ValueError:
+    await message.answer(
+        "⚠️ Игровой ID должен быть целым числом.", parse_mode="Markdown"
+    )
+    return
+
+  fac_arg = parts[1].lower()
+  if fac_arg != "none" and fac_arg not in FACTIONS:
+    await message.answer(
+        "⚠️ Фракция должна быть `guards`, `seekers`, `bastion` или `none`.",
+        parse_mode="Markdown",
+    )
+    return
+
+  target = get_user_by_game_id(gid)
+  if not target:
+    await message.answer(
+        f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
+    )
+    return
+
+  old_fac = target.get("faction")
+  if old_fac and faction_leaders.get(old_fac) == gid:
+    del faction_leaders[old_fac]
+
+  if fac_arg == "none":
+    target["faction"] = None
+    target["hp"] = min(MAX_HP, target.get("hp", MAX_HP))
+    save_data()
+    await state.clear()
+    await message.answer(
+        f"✅ Фракция снята с игрока `{gid}` (**{target['name']}**).",
+        reply_markup=admin_keyboard(message.from_user.id),
+        parse_mode="Markdown",
+    )
+    return
+
+  target["faction"] = fac_arg
+  max_hp = get_max_hp(target)
+  if FACTIONS[fac_arg]["hp_bonus"] > 0:
+    target["hp"] = min(
+        max_hp, target.get("hp", MAX_HP) + FACTIONS[fac_arg]["hp_bonus"]
+    )
+  else:
+    target["hp"] = min(max_hp, target.get("hp", MAX_HP))
+
+  save_data()
+  await state.clear()
+  await message.answer(
+      f"✅ Игрок `{gid}` (**{target['name']}**) переведён во фракцию"
+      f" **{FACTIONS[fac_arg]['name']}**.",
+      reply_markup=admin_keyboard(message.from_user.id),
+      parse_mode="Markdown",
+  )
 
 
 @dp.callback_query(F.data == "adm_set_leader")
@@ -863,47 +1171,49 @@ async def process_set_leader(message: Message, state: FSMContext):
     )
     return
 
-  if gid == 0:
-    faction_leaders.pop(fac_key, None)
+    if gid == 0:
+      faction_leaders.pop(fac_key, None)
+      save_data()
+      await state.clear()
+      await message.answer(
+          f"✅ Лидер фракции **{FACTIONS[fac_key]['name']}** снят.",
+          reply_markup=admin_keyboard(message.from_user.id),
+          parse_mode="Markdown",
+      )
+      return
+
+    target = get_user_by_game_id(gid)
+    if not target:
+      await message.answer(
+          f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
+      )
+      return
+
+    old_fac = target.get("faction")
+    if old_fac and old_fac != fac_key and faction_leaders.get(old_fac) == gid:
+      del faction_leaders[old_fac]
+
+    target["faction"] = fac_key
+    max_hp = get_max_hp(target)
+    target["hp"] = min(
+        max_hp,
+        max(
+            target.get("hp", MAX_HP),
+            max_hp
+            if FACTIONS[fac_key]["hp_bonus"] > 0
+            else target.get("hp", MAX_HP),
+        ),
+    )
+    faction_leaders[fac_key] = gid
     save_data()
+
     await state.clear()
     await message.answer(
-        f"✅ Лидер фракции **{FACTIONS[fac_key]['name']}** снят.",
+        f"✅ Игрок `{gid}` (**{target['name']}**) назначен лидером фракции"
+        f" **{FACTIONS[fac_key]['name']}**!",
         reply_markup=admin_keyboard(message.from_user.id),
         parse_mode="Markdown",
     )
-    return
-
-  target = get_user_by_game_id(gid)
-  if not target:
-    await message.answer(
-        f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
-    )
-    return
-
-  old_fac = target.get("faction")
-  if old_fac and old_fac != fac_key and faction_leaders.get(old_fac) == gid:
-    del faction_leaders[old_fac]
-
-  target["faction"] = fac_key
-  max_hp = get_max_hp(target)
-  target["hp"] = min(
-      max_hp,
-      max(
-          target.get("hp", MAX_HP),
-          max_hp if FACTIONS[fac_key]["hp_bonus"] > 0 else target.get("hp", MAX_HP),
-      ),
-  )
-  faction_leaders[fac_key] = gid
-  save_data()
-
-  await state.clear()
-  await message.answer(
-      f"✅ Игрок `{gid}` (**{target['name']}**) назначен лидером фракции"
-      f" **{FACTIONS[fac_key]['name']}**!",
-      reply_markup=admin_keyboard(message.from_user.id),
-      parse_mode="Markdown",
-  )
 
 
 @dp.callback_query(F.data == "adm_give_coins")
@@ -1075,6 +1385,63 @@ async def process_set_game_id(message: Message, state: FSMContext):
   await message.answer(
       f"✅ Игровой ID для **{target['name']}** изменён: `{old_gid}` →"
       f" **`{new_gid}`**.",
+      reply_markup=admin_keyboard(message.from_user.id),
+      parse_mode="Markdown",
+  )
+
+
+@dp.callback_query(F.data == "adm_reset_user")
+async def on_adm_reset_user(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+  await state.set_state(GameStates.waiting_reset_confirm)
+  await callback.message.answer(
+      "⚠️ Для сброса прогресса игрока отправь:\n`ПОДТВЕРДИТЬ ИГРОВОЙ_ID`\n"
+      "Пример: `ПОДТВЕРДИТЬ 1002`",
+      parse_mode="Markdown",
+  )
+  await callback.answer()
+
+
+@dp.message(GameStates.waiting_reset_confirm)
+async def process_reset_user(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  parts = (message.text or "").strip().split()
+  if len(parts) != 2 or parts[0].upper() != "ПОДТВЕРДИТЬ":
+    await message.answer(
+        "⚠️ Формат: `ПОДТВЕРДИТЬ ИГРОВОЙ_ID`.", parse_mode="Markdown"
+    )
+    return
+  try:
+    gid = int(parts[1])
+  except ValueError:
+    await message.answer(
+        "⚠️ Игровой ID должен быть целым числом.", parse_mode="Markdown"
+    )
+    return
+
+  target = get_user_by_game_id(gid)
+  if not target:
+    await message.answer(
+        f"⚠️ Игрок с игровым ID `{gid}` не найден.", parse_mode="Markdown"
+    )
+    return
+
+  old_fac = target.get("faction")
+  if old_fac and faction_leaders.get(old_fac) == gid:
+    del faction_leaders[old_fac]
+
+  tg_id = target["tg_id"]
+  name = target.get("name", "Игрок")
+  users[tg_id] = default_user_profile(tg_id, gid, name)
+  save_data()
+  await state.clear()
+
+  await message.answer(
+      f"🔄 Прогресс игрока `{gid}` (**{name}**) сброшен до начального.",
       reply_markup=admin_keyboard(message.from_user.id),
       parse_mode="Markdown",
   )
