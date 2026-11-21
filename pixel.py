@@ -1171,9 +1171,11 @@ async def cmd_announce(message: Message, bot: Bot):
         f"📨 Доставлено: **{sent_ok}**\n"
         f"⚠️ Не доставлено: **{sent_fail}**",
         parse_mode="Markdown",
-        
-        @dp.message(Command("ban"))
+    )
+
+@dp.message(Command("ban"))
 async def cmd_ban(message: Message):
+
     uid = message.from_user.id
     actor_rank = get_admin_rank(uid)
     if actor_rank < 3:
