@@ -106,6 +106,8 @@ def normalize_player(p: dict, tg_id: int, full_name: str = "") -> dict:
     p.setdefault("lvl", 1)
     p.setdefault("xp", 0)
     p.setdefault("wanted", 0)
+    p.setdefault("banned", False)
+    p.setdefault("ban_reason", "")
     p["wanted"] = max(0, min(5, int(p.get("wanted", 0))))
     p.setdefault("faction", "none")
     if p["faction"] not in FACTIONS:
@@ -202,6 +204,11 @@ def get_admin_rank(user_id: int | None) -> int:
         tg_id = user_id
     normalize_player(u, tg_id)
     return int(u.get("admin_rank", 0))
+
+
+def is_banned(p: dict | None) -> bool:
+    return bool(p and p.get("banned"))
+
 
 
 def is_admin(user_id: int | None, min_rank: int = 1) -> bool:
@@ -358,29 +365,31 @@ def admin_help_text(user_id: int | None) -> str:
     lines = [
         "🛠 **Панель администрации CRMP**",
         f"Ваш ранг: **{ADMIN_RANKS.get(arank, str(arank))}** | Игроков в базе: `{len(users)}`\n",
-        "**Доступные команды:**",
+        "**Все команды администрации:**",
+        "• `/admin` — список команд админки (1+ ранг)",
+        "• `/playerinfo <ID>` — полное досье игрока (1+ ранг)",
+        "• `/clearwanted <ID>` — снять розыск игроку (1+ ранг)",
+        "• `/setwanted <ID> <0..5>` — задать уровень розыска (2+ ранг)",
+        "• `/givemoney <ID> <сумма>` — выдать/снять рубли (2+ ранг)",
+        "• `/setlvl <ID> <уровень>` — поставить уровень (2+ ранг)",
+        "• `/announce <текст>` — объявление всем игрокам (3+ ранг / медиа)",
+        "• `/mediaprize <ID> <сумма>` — выдать медиа-приз (3+ ранг / медиа)",
+        "• `/ban <ID> [причина]` — забанить игрока (3+ ранг)",
+        "• `/unban <ID>` — разбанить игрока (3+ ранг)",
+        "• `/wipe <ID>` — обнулить аккаунт игрока (4+ ранг)",
     ]
-    if arank >= 1:
-        lines.append("`/playerinfo <ID>` — полное досье игрока")
-        lines.append("`/clearwanted <ID>` — снять розыск игроку")
-    if arank >= 2:
-        lines.append("`/setwanted <ID> <0..5>` — задать уровень розыска")
-        lines.append("`/givemoney <ID> <сумма>` — выдать/снять рубли")
-        lines.append("`/setlvl <ID> <уровень>` — поставить уровень")
-    if arank >= 3:
-        lines.append("`/announce <текст>` — объявление всем игрокам")
-        lines.append("`/mediaprize <ID> <сумма>` — выдать медиа-приз")
     if is_owner(user_id):
         fac_keys = ", ".join(f"`{k}`" for k in FACTIONS if k != "none")
         lines.extend(
             [
                 "\n👑 **Команды создателя (5 ранг):**",
-                "`/setadmin <ID> <0..5>` — выдать/изменить/снять ранг админа",
-                "`/setmedia <ID> <0|1>` — выдать/снять медиа-админку",
-                f"`/setleader <ID> <фракция|none>` — назначить/снять лидера\nФракции: {fac_keys}",
+                "• `/setadmin <ID> <0..5>` — выдать/изменить/снять ранг админа",
+                "• `/setmedia <ID> <0|1>` — выдать/снять медиа-админку",
+                f"• `/setleader <ID> <фракция|none>` — назначить/снять лидера\nФракции: {fac_keys}",
             ]
         )
     return "\n".join(lines)
+
 
 
 dp = Dispatcher()
@@ -1162,7 +1171,125 @@ async def cmd_announce(message: Message, bot: Bot):
         f"📨 Доставлено: **{sent_ok}**\n"
         f"⚠️ Не доставлено: **{sent_fail}**",
         parse_mode="Markdown",
+        
+        @dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    uid = message.from_user.id
+    actor_rank = get_admin_rank(uid)
+    if actor_rank < 3:
+        await message.answer("⛔ Банить игроков можно с **3 ранга** администратора.", parse_mode="Markdown")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Формат: `/ban <игровой_ID> [причина]`", parse_mode="Markdown")
+        return
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await message.answer("Игровой ID должен быть числом.")
+        return
+
+    reason = parts[2].strip() if len(parts) == 3 and parts[2].strip() else "Нарушение правил сервера"
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    target_tg = target.get("tg_id")
+    if is_owner(target_tg):
+        await message.answer("⛔ Нельзя забанить создателя проекта.")
+        return
+    if target_tg and get_admin_rank(target_tg) >= actor_rank and not is_owner(uid):
+        await message.answer("⛔ Нельзя забанить администратора равного или старшего ранга.")
+        return
+
+    target["banned"] = True
+    target["ban_reason"] = reason
+    save_state()
+    await message.answer(
+        f"🔨 Игрок **{target['name']}** (`#{gid}`) забанен.\nПричина: **{reason}**",
+        parse_mode="Markdown",
     )
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    uid = message.from_user.id
+    if not is_admin(uid, 3):
+        await message.answer("⛔ Разбанивать игроков можно с **3 ранга** администратора.", parse_mode="Markdown")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Формат: `/unban <игровой_ID>`", parse_mode="Markdown")
+        return
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await message.answer("Игровой ID должен быть числом.")
+        return
+
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    target["banned"] = False
+    target["ban_reason"] = ""
+    save_state()
+    await message.answer(f"🔓 Игрок **{target['name']}** (`#{gid}`) разбанен.", parse_mode="Markdown")
+
+
+@dp.message(Command("wipe"))
+async def cmd_wipe(message: Message):
+    uid = message.from_user.id
+    if not is_admin(uid, 4):
+        await message.answer("⛔ Обнулять аккаунты можно с **4 ранга** администратора.", parse_mode="Markdown")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Формат: `/wipe <игровой_ID>`", parse_mode="Markdown")
+        return
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await message.answer("Игровой ID должен быть числом.")
+        return
+
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    if is_owner(target.get("tg_id")):
+        await message.answer("⛔ Нельзя обнулить аккаунт создателя проекта.")
+        return
+
+    target["money"] = 1000
+    target["lvl"] = 1
+    target["xp"] = 0
+    target["wanted"] = 0
+    target["faction"] = "none"
+    target["rank"] = 1
+    target["leader_of"] = None
+    target["disguise"] = "off"
+    target["car"] = "none"
+    target["house"] = "none"
+    target["city"] = "arzamas"
+    target["last_shift"] = 0.0
+    target["last_crime"] = 0.0
+    target["last_daily"] = 0.0
+    target["last_raid"] = 0.0
+    save_state()
+
+    await message.answer(
+        f"🧹 Аккаунт игрока **{target['name']}** (`#{gid}`) полностью обнулён до стартовых значений.",
+        parse_mode=None,
+    )
+
+    
 
 
 # --- МЕНЮ И КНОПКИ ---
