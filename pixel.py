@@ -12,14 +12,14 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = 5516453543  # Твой Telegram ID
+OWNER_ID = 5516435343
 
 DATA_FILE = "crmp_russia_data.json"
 START_GAME_ID = 1001
 
-SHIFT_COOLDOWN = 45      # сек между рабочими сменами
-CRIME_COOLDOWN = 60      # сек между криминальными делами
-DAILY_COOLDOWN = 86400   # ежедневный бонус (24 часа)
+SHIFT_COOLDOWN = 45       # сек между рабочими сменами
+CRIME_COOLDOWN = 60       # сек между криминальными делами
+DAILY_COOLDOWN = 86400    # ежедневный бонус (24 часа)
 
 CITIES = {
     "arzamas": "🏙 г. Арзамас",
@@ -128,27 +128,32 @@ def add_xp(p: dict, amount: int) -> bool:
     return up
 
 
-def main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🪪 Паспорт", callback_data="m_passport"),
-                InlineKeyboardButton(text="🗺 Навигатор", callback_data="m_cities"),
-            ],
-            [
-                InlineKeyboardButton(text="💼 Работа / Фракции", callback_data="m_work"),
-                InlineKeyboardButton(text="🔫 Криминал / ОПГ", callback_data="m_crime"),
-            ],
-            [
-                InlineKeyboardButton(text="🚗 Автосалон", callback_data="m_cars"),
-                InlineKeyboardButton(text="🏠 Недвижимость", callback_data="m_houses"),
-            ],
-            [
-                InlineKeyboardButton(text="🎁 Ежедневный бонус", callback_data="m_daily"),
-                InlineKeyboardButton(text="🏆 Топ области", callback_data="m_top"),
-            ],
-        ]
-    )
+def is_admin(user_id: int | None) -> bool:
+    return user_id == OWNER_ID
+
+
+def main_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🪪 Паспорт", callback_data="m_passport"),
+            InlineKeyboardButton(text="🗺 Навигатор", callback_data="m_cities"),
+        ],
+        [
+            InlineKeyboardButton(text="💼 Работа / Фракции", callback_data="m_work"),
+            InlineKeyboardButton(text="🔫 Криминал / ОПГ", callback_data="m_crime"),
+        ],
+        [
+            InlineKeyboardButton(text="🚗 Автосалон", callback_data="m_cars"),
+            InlineKeyboardButton(text="🏠 Недвижимость", callback_data="m_houses"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Ежедневный бонус", callback_data="m_daily"),
+            InlineKeyboardButton(text="🏆 Топ области", callback_data="m_top"),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="m_admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_passport(p: dict) -> str:
@@ -158,8 +163,10 @@ def format_passport(p: dict) -> str:
     city = CITIES.get(p["city"], CITIES["arzamas"])
     stars = "⭐" * p["wanted"] if p["wanted"] > 0 else "Чист"
     need_xp = p["lvl"] * 120
+    role_line = "👑 Статус: **Создатель проекта**\n" if is_admin(p.get("tg_id")) else ""
     return (
         f"🪪 **Паспорт гражданина РФ**\n"
+        f"{role_line}"
         f"👤 Имя: **{p['name']}** | 🆔 Игровой ID: **`{p['game_id']}`**\n\n"
         f"💵 Наличные: **{p['money']} ₽**\n"
         f"🎖 Уровень: **{p['lvl']}** (`{p['xp']}/{need_xp} XP`)\n"
@@ -171,24 +178,37 @@ def format_passport(p: dict) -> str:
     )
 
 
+def admin_help_text() -> str:
+    return (
+        "🛠 **Панель создателя CRMP**\n"
+        f"👑 Твой TG ID: `{OWNER_ID}` | Игроков в базе: `{len(users)}`\n\n"
+        "`/givemoney <ID> <сумма>` — выдать/снять рубли\n"
+        "`/setlvl <ID> <уровень>` — поставить уровень\n"
+        "`/clearwanted <ID>` — снять розыск игроку\n"
+        "`/announce <текст>` — объявление всем игрокам"
+    )
+
+
 dp = Dispatcher()
 
 
 @dp.message(CommandStart())
 @dp.message(Command("menu"))
 async def cmd_start(message: Message):
-    p = get_player(message.from_user.id, message.from_user.full_name)
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
     await message.answer(
         "🇷🇺 **CRMP — Криминальная Россия**\n"
-        "Перевод игроку по ID: `/pay 1002 500`\n\n"
+        "Перевод игроку по ID: `/pay 1001 500`\n\n"
         + format_passport(p),
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
 
 
 @dp.message(Command("pay"))
 async def cmd_pay(message: Message):
+    uid = message.from_user.id
     parts = (message.text or "").split()
     if len(parts) != 3:
         await message.answer("Формат: `/pay <игровой_ID> <сумма>`", parse_mode="Markdown")
@@ -204,7 +224,7 @@ async def cmd_pay(message: Message):
         await message.answer("Сумма должна быть больше 0.")
         return
 
-    sender = get_player(message.from_user.id, message.from_user.full_name)
+    sender = get_player(uid, message.from_user.full_name)
     if sender["game_id"] == target_gid:
         await message.answer("Нельзя перевести деньги самому себе.")
         return
@@ -223,29 +243,24 @@ async def cmd_pay(message: Message):
     save_state()
     await message.answer(
         f"💸 Переведено **{amount} ₽** игроку **{target['name']}** (ID `{target_gid}`).",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
 
 
-# --- АДМИН-КОМАНДЫ ДЛЯ OWNER_ID ---
+# --- АДМИН-КОМАНДЫ ---
 @dp.message(Command("admin"))
 async def cmd_admin_help(message: Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа к админ-панели.")
         return
-    await message.answer(
-        "🛠 **Панель создателя CRMP:**\n"
-        "`/givemoney <ID> <сумма>` — выдать рубли\n"
-        "`/setlvl <ID> <уровень>` — поставить уровень\n"
-        "`/clearwanted <ID>` — снять розыск игроку\n"
-        "`/announce <текст>` — объявление всем игрокам",
-        parse_mode="Markdown",
-    )
+    await message.answer(admin_help_text(), parse_mode="Markdown")
 
 
 @dp.message(Command("givemoney"))
 async def cmd_givemoney(message: Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
     if len(parts) != 3:
@@ -254,11 +269,11 @@ async def cmd_givemoney(message: Message):
     try:
         gid, amount = int(parts[1]), int(parts[2])
     except ValueError:
-        await message.answer("Нужны числа.")
+        await message.answer("Нужны целые числа.")
         return
     target = find_by_game_id(gid)
     if not target:
-        await message.answer("Игрок не найден.")
+        await message.answer("Игрок с таким игровым ID не найден.")
         return
     target["money"] = max(0, target["money"] + amount)
     save_state()
@@ -267,7 +282,8 @@ async def cmd_givemoney(message: Message):
 
 @dp.message(Command("setlvl"))
 async def cmd_setlvl(message: Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
     if len(parts) != 3:
@@ -276,11 +292,11 @@ async def cmd_setlvl(message: Message):
     try:
         gid, lvl = int(parts[1]), max(1, int(parts[2]))
     except ValueError:
-        await message.answer("Нужны числа.")
+        await message.answer("Нужны целые числа.")
         return
     target = find_by_game_id(gid)
     if not target:
-        await message.answer("Игрок не найден.")
+        await message.answer("Игрок с таким игровым ID не найден.")
         return
     target["lvl"] = lvl
     target["rank"] = min(10, lvl)
@@ -290,7 +306,8 @@ async def cmd_setlvl(message: Message):
 
 @dp.message(Command("clearwanted"))
 async def cmd_admin_clearwanted(message: Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
     if len(parts) != 2:
@@ -299,11 +316,11 @@ async def cmd_admin_clearwanted(message: Message):
     try:
         gid = int(parts[1])
     except ValueError:
-        await message.answer("Нужен числовой ID.")
+        await message.answer("Нужен числовой игровой ID.")
         return
     target = find_by_game_id(gid)
     if not target:
-        await message.answer("Игрок не найден.")
+        await message.answer("Игрок с таким игровым ID не найден.")
         return
     target["wanted"] = 0
     save_state()
@@ -312,7 +329,8 @@ async def cmd_admin_clearwanted(message: Message):
 
 @dp.message(Command("announce"))
 async def cmd_announce(message: Message, bot: Bot):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
         return
 
     raw_text = (message.text or "").split(maxsplit=1)
@@ -351,10 +369,20 @@ async def cmd_announce(message: Message, bot: Bot):
 
 
 # --- МЕНЮ И КНОПКИ ---
+@dp.callback_query(F.data == "m_admin")
+async def cb_admin(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет прав администратора", show_alert=True)
+        return
+    await callback.message.answer(admin_help_text(), reply_markup=main_kb(callback.from_user.id), parse_mode="Markdown")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "m_passport")
 async def cb_passport(callback: CallbackQuery):
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
-    await callback.message.answer(format_passport(p), reply_markup=main_kb(), parse_mode="Markdown")
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    await callback.message.answer(format_passport(p), reply_markup=main_kb(uid), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -373,16 +401,17 @@ async def cb_cities(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("go_city:"))
 async def cb_go_city(callback: CallbackQuery):
+    uid = callback.from_user.id
     cid = callback.data.split(":", 1)[1]
     if cid not in CITIES:
         await callback.answer("Город не найден", show_alert=True)
         return
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    p = get_player(uid, callback.from_user.full_name)
     p["city"] = cid
     save_state()
     await callback.message.answer(
         f"🚕 Ты прибыл в **{CITIES[cid]}**!",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -414,12 +443,13 @@ async def cb_work(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("join_fac:"))
 async def cb_join_fac(callback: CallbackQuery):
+    uid = callback.from_user.id
     fid = callback.data.split(":", 1)[1]
     info = FACTIONS.get(fid)
     if not info:
         await callback.answer("Организация не найдена", show_alert=True)
         return
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    p = get_player(uid, callback.from_user.full_name)
     if p["lvl"] < info["min_lvl"]:
         await callback.answer(f"Нужен {info['min_lvl']} уровень!", show_alert=True)
         return
@@ -430,7 +460,7 @@ async def cb_join_fac(callback: CallbackQuery):
     save_state()
     await callback.message.answer(
         f"✅ Ты вступил в **{info['name']}**!",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -438,7 +468,8 @@ async def cb_join_fac(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "do_shift")
 async def cb_do_shift(callback: CallbackQuery):
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
     now = time.time()
     rem = int(SHIFT_COOLDOWN - (now - p["last_shift"]))
     if rem > 0:
@@ -460,7 +491,7 @@ async def cb_do_shift(callback: CallbackQuery):
         f"💼 Смена завершена (**{fac['name']}**)\n"
         f"💵 Зарплата: **+{pay} ₽**\n"
         f"✨ Опыт: **+{xp_gain} XP**{extra}",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -488,7 +519,8 @@ async def cb_crime(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "do_crime")
 async def cb_do_crime(callback: CallbackQuery):
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
     now = time.time()
     rem = int(CRIME_COOLDOWN - (now - p["last_crime"]))
     if rem > 0:
@@ -510,7 +542,7 @@ async def cb_do_crime(callback: CallbackQuery):
         await callback.message.answer(
             f"🔥 **Дело выгорело!** Ты ушёл от хвоста.\n"
             f"💰 Куш: **+{loot} ₽** | ✨ **+{xp_gain} XP**{extra}",
-            reply_markup=main_kb(),
+            reply_markup=main_kb(uid),
             parse_mode="Markdown",
         )
     else:
@@ -522,7 +554,7 @@ async def cb_do_crime(callback: CallbackQuery):
             f"🚨 **План «Перехват»!** Патруль засёк тачку.\n"
             f"💸 Потери: **-{fine} ₽**\n"
             f"⭐ Уровень розыска: **{p['wanted']}/5**",
-            reply_markup=main_kb(),
+            reply_markup=main_kb(uid),
             parse_mode="Markdown",
         )
     await callback.answer()
@@ -530,7 +562,8 @@ async def cb_do_crime(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "do_bribe")
 async def cb_bribe(callback: CallbackQuery):
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
     if p["wanted"] == 0:
         await callback.answer("У тебя нет розыска.", show_alert=True)
         return
@@ -543,7 +576,7 @@ async def cb_bribe(callback: CallbackQuery):
     save_state()
     await callback.message.answer(
         f"🕵️ Решала закрыл вопрос за **{cost} ₽**. Розыск снят!",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -570,12 +603,13 @@ async def cb_cars(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_car:"))
 async def cb_buy_car(callback: CallbackQuery):
+    uid = callback.from_user.id
     cid = callback.data.split(":", 1)[1]
     info = CARS.get(cid)
     if not info:
         await callback.answer("Машина не найдена", show_alert=True)
         return
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    p = get_player(uid, callback.from_user.full_name)
     if p["car"] == cid:
         await callback.answer("Эта машина уже у тебя!", show_alert=True)
         return
@@ -585,7 +619,7 @@ async def cb_buy_car(callback: CallbackQuery):
     p["money"] -= info["price"]
     p["car"] = cid
     save_state()
-    await callback.message.answer(f"🎉 Ты купил **{info['name']}**!", reply_markup=main_kb(), parse_mode="Markdown")
+    await callback.message.answer(f"🎉 Ты купил **{info['name']}**!", reply_markup=main_kb(uid), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -606,23 +640,17 @@ async def cb_houses(callback: CallbackQuery):
     rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="m_passport")])
     await callback.message.answer("🏠 **Агентство недвижимости:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="Markdown")
     await callback.answer()
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="m_passport")])
-    await callback.message.answer(
-        "🏠 **Агентство недвижимости:**",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="Markdown",
-    )
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("buy_house:"))
 async def cb_buy_house(callback: CallbackQuery):
+    uid = callback.from_user.id
     hid = callback.data.split(":", 1)[1]
     info = HOUSES.get(hid)
     if not info:
         await callback.answer("Жильё не найдено", show_alert=True)
         return
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    p = get_player(uid, callback.from_user.full_name)
     if p["house"] == hid:
         await callback.answer("Это жильё уже твоё!", show_alert=True)
         return
@@ -632,13 +660,14 @@ async def cb_buy_house(callback: CallbackQuery):
     p["money"] -= info["price"]
     p["house"] = hid
     save_state()
-    await callback.message.answer(f"🔑 Поздравляем с новосельем: **{info['name']}**!", reply_markup=main_kb(), parse_mode="Markdown")
+    await callback.message.answer(f"🔑 Поздравляем с новосельем: **{info['name']}**!", reply_markup=main_kb(uid), parse_mode="Markdown")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "m_daily")
 async def cb_daily(callback: CallbackQuery):
-    p = get_player(callback.from_user.id, callback.from_user.full_name)
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
     now = time.time()
     rem = int(DAILY_COOLDOWN - (now - p["last_daily"]))
     if rem > 0:
@@ -652,7 +681,7 @@ async def cb_daily(callback: CallbackQuery):
     save_state()
     await callback.message.answer(
         f"🎁 Ты забрал ежедневный бонус: **+{bonus} ₽**!",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
         parse_mode="Markdown",
     )
     await callback.answer()
@@ -660,6 +689,7 @@ async def cb_daily(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "m_top")
 async def cb_top(callback: CallbackQuery):
+    uid = callback.from_user.id
     if not users:
         await callback.answer("Список пуст", show_alert=True)
         return
@@ -667,7 +697,7 @@ async def cb_top(callback: CallbackQuery):
     lines = ["🏆 **Топ-10 граждан области:**\n"]
     for idx, u in enumerate(ranked, start=1):
         lines.append(f"{idx}. **{u['name']}** (`#{u['game_id']}`) — {u['lvl']} ур. | {u['money']} ₽")
-    await callback.message.answer("\n".join(lines), reply_markup=main_kb(), parse_mode="Markdown")
+    await callback.message.answer("\n".join(lines), reply_markup=main_kb(uid), parse_mode="Markdown")
     await callback.answer()
 
 
