@@ -20,7 +20,7 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DATA_FILE = os.getenv("DATA_FILE", "crmp_russia_data.json")
-CREATOR_ID = int(os.getenv("CREATOR_ID", "0"))
+CREATOR_ID = int(os.getenv("CREATOR_ID", "5516435343"))
 
 FACTIONS: dict[str, dict[str, Any]] = {
     "dps": {"name": "ГИБДД / ДПС", "salary": 1800, "npc": "Инспектор Воробьёв"},
