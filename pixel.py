@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import time
 from typing import Any
 
@@ -19,7 +20,7 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DATA_FILE = os.getenv("DATA_FILE", "crmp_russia_data.json")
-CREATOR_ID = int(os.getenv("CREATOR_ID", "5516435343"))
+CREATOR_ID = int(os.getenv("CREATOR_ID", "0"))
 
 FACTIONS: dict[str, dict[str, Any]] = {
     "dps": {"name": "ГИБДД / ДПС", "salary": 1800, "npc": "Инспектор Воробьёв"},
@@ -79,6 +80,8 @@ promocodes: dict[str, dict[str, Any]] = {}
 support_tickets: dict[str, dict[str, Any]] = {}
 next_game_id: int = 100
 next_ticket_id: int = 1
+maintenance_mode: bool = False
+maintenance_reason: str = "Проводятся технические работы. Попробуйте позже."
 
 
 class SupportStates(StatesGroup):
@@ -108,6 +111,8 @@ def normalize_player(u: dict[str, Any], tg_id: int) -> dict[str, Any]:
     u["is_media"] = bool(u.get("is_media", False))
     u["banned"] = bool(u.get("banned", False))
     u["ban_reason"] = str(u.get("ban_reason") or "")
+    u["tempban_until"] = float(u.get("tempban_until", 0.0))
+    u["tempban_reason"] = str(u.get("tempban_reason") or "")
     u["wanted"] = max(0, min(6, int(u.get("wanted", 0))))
     u["fines"] = max(0, int(u.get("fines", 0)))
     u["last_work"] = float(u.get("last_work", 0.0))
@@ -204,7 +209,10 @@ def load_state() -> None:
         return
 
     next_game_id = max(100, int(raw.get("next_game_id", 100)))
+    global maintenance_mode, maintenance_reason
     next_ticket_id = max(1, int(raw.get("next_ticket_id", 1)))
+    maintenance_mode = bool(raw.get("maintenance_mode", False))
+    maintenance_reason = str(raw.get("maintenance_reason") or "Проводятся технические работы. Попробуйте позже.")
 
     raw_users = raw.get("users") if isinstance(raw.get("users"), dict) else {}
     for k, v in raw_users.items():
@@ -262,6 +270,8 @@ def save_state() -> None:
     payload = {
         "next_game_id": next_game_id,
         "next_ticket_id": next_ticket_id,
+        "maintenance_mode": maintenance_mode,
+        "maintenance_reason": maintenance_reason,
         "users": users,
         "faction_apps": faction_apps,
         "businesses": businesses,
@@ -275,6 +285,53 @@ def save_state() -> None:
     os.replace(tmp_file, DATA_FILE)
 
 
+def parse_duration_seconds(raw_dur: str) -> int | None:
+    s = raw_dur.strip().lower()
+    if not s:
+        return None
+    if s.isdigit():
+        # Plain number treated as minutes
+        mins = int(s)
+        return mins * 60 if mins > 0 else None
+    total = 0
+    matches = re.findall(r"(\d+)\s*([smhdчдмн]|сек|мин|час|дн|день|дня|дней)", s)
+    if not matches:
+        return None
+    joined_len = sum(len(m[0]) + len(m[1]) for m in matches)
+    if joined_len < len(re.sub(r"\s+", "", s)):
+        return None
+    for num_str, unit in matches:
+        val = int(num_str)
+        if val <= 0:
+            return None
+        if unit in {"s", "сек"}:
+            total += val
+        elif unit in {"m", "мин"}:
+            total += val * 60
+        elif unit in {"h", "ч", "час"}:
+            total += val * 3600
+        elif unit in {"d", "д", "дн", "день", "дня", "дней"}:
+            total += val * 86400
+    return total if total > 0 else None
+
+
+def format_duration(seconds: float) -> str:
+    sec = max(1, int(seconds))
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} д.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if mins:
+        parts.append(f"{mins} мин.")
+    if secs and not days:
+        parts.append(f"{secs} сек.")
+    return " ".join(parts) if parts else "меньше минуты"
+
+
 class BanMiddleware:
     async def __call__(self, handler, event, data):
         uid = None
@@ -285,14 +342,38 @@ class BanMiddleware:
 
         if uid is not None and not is_creator(uid):
             u = users.get(str(uid))
-            if isinstance(u, dict) and u.get("banned"):
-                reason = u.get("ban_reason") or "Нарушение правил сервера"
-                text = f"🚫 Ваш аккаунт заблокирован.\nПричина: {reason}"
-                if isinstance(event, Message):
-                    await event.answer(text)
-                elif isinstance(event, CallbackQuery):
-                    await event.answer(text, show_alert=True)
-                return
+            if isinstance(u, dict):
+                if u.get("banned"):
+                    reason = u.get("ban_reason") or "Нарушение правил сервера"
+                    text = f"🚫 Ваш аккаунт заблокирован.\nПричина: {reason}"
+                    if isinstance(event, Message):
+                        await event.answer(text)
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer(text, show_alert=True)
+                    return
+                tb_until = float(u.get("tempban_until", 0.0) or 0.0)
+                if tb_until > 0:
+                    now_ts = time.time()
+                    if now_ts < tb_until:
+                        rem_txt = format_duration(tb_until - now_ts)
+                        tb_reason = u.get("tempban_reason") or "Нарушение правил сервера"
+                        text = f"⏳ Ваш аккаунт временно заблокирован.\nОсталось: **{rem_txt}**\nПричина: {tb_reason}"
+                        if isinstance(event, Message):
+                            await safe_answer(event, text, parse_mode="Markdown")
+                        elif isinstance(event, CallbackQuery):
+                            await event.answer(f"⏳ Временный бан ({rem_txt}). Причина: {tb_reason}", show_alert=True)
+                        return
+                    else:
+                        u["tempban_until"] = 0.0
+                        u["tempban_reason"] = ""
+                        save_state()
+        if uid is not None and maintenance_mode and not is_admin(uid, 1):
+            m_text = f"🛠 **Технические работы**\n{maintenance_reason}"
+            if isinstance(event, Message):
+                await safe_answer(event, m_text, parse_mode="Markdown")
+            elif isinstance(event, CallbackQuery):
+                await event.answer(f"🛠 Технические работы: {maintenance_reason}", show_alert=True)
+            return
         return await handler(event, data)
 
 
@@ -387,6 +468,8 @@ async def cmd_help(message: Message):
             "• `/setmedia <ID> <0|1>` — выдать роль медиа",
             "• `/setadmin <ID> <0..5>` — выдать уровень админа",
             "• `/ban <ID> [причина]` и `/unban <ID>`",
+            "• `/tempban <ID> <срок> [причина]` и `/untempban <ID>`",
+            "• `/resetplayer <ID>` и `/wipeall CONFIRM`",
         ])
     await safe_answer(message, "\n".join(lines), reply_markup=main_kb(uid), parse_mode="Markdown")
 
@@ -1138,7 +1221,8 @@ async def cmd_players(message: Message):
     items.sort(key=lambda x: int(x.get("game_id", 0)))
     lines = [f"📋 **Игроки** (всего: `{len(items)}`):\n"]
     for u in items[:40]:
-        ban_tag = " 🚫" if u.get("banned") else ""
+        has_tb = float(u.get("tempban_until", 0.0) or 0.0) > time.time()
+        ban_tag = " 🚫" if u.get("banned") else (" ⏳" if has_tb else "")
         lines.append(
             f"• **`#{u['game_id']}`** {u['name']} — {u['lvl']} ур. | {u['money'] + u['bank']} ₽{ban_tag}"
         )
@@ -1275,8 +1359,102 @@ async def cmd_unban(message: Message):
         return
     target["banned"] = False
     target["ban_reason"] = ""
+    target["tempban_until"] = 0.0
+    target["tempban_reason"] = ""
     save_state()
-    await safe_answer(message, f"✅ Игрок **{target['name']}** (`#{gid}`) разблокирован.", parse_mode="Markdown")
+    await safe_answer(message, f"✅ Игрок **{target['name']}** (`#{gid}`) разблокирован (сняты постоянный и временный баны).", parse_mode="Markdown")
+
+@dp.message(Command("tempban"))
+async def cmd_tempban(message: Message, bot: Bot):
+    uid = message.from_user.id
+    if not is_admin(uid, 2):
+        await safe_answer(message, "⛔ Выдавать временные баны можно со 2 ранга администратора.")
+        return
+
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await safe_answer(
+            message,
+            "Формат: `/tempban <игровой_ID> <срок> [причина]`\n"
+            "Примеры срока: `30m`, `2h`, `1d`, `1d12h`, `45` (минуты)",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await safe_answer(message, "Игровой ID должен быть числом.")
+        return
+
+    dur_sec = parse_duration_seconds(parts[2])
+    if not dur_sec or dur_sec > 365 * 86400:
+        await safe_answer(
+            message,
+            "Некорректный срок. Используйте формат вроде `15m`, `3h`, `2d` (до 365 дней).",
+            parse_mode="Markdown",
+        )
+        return
+
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок `#{gid}` не найден.", parse_mode="Markdown")
+        return
+
+    target_tg_id = int(target["tg_id"])
+    if is_creator(target_tg_id):
+        await safe_answer(message, "Нельзя временно заблокировать создателя.")
+        return
+
+    reason = parts[3].strip() if len(parts) == 4 and parts[3].strip() else "Нарушение правил сервера"
+    until_ts = time.time() + dur_sec
+    target["tempban_until"] = until_ts
+    target["tempban_reason"] = reason
+    save_state()
+
+    dur_txt = format_duration(dur_sec)
+    await safe_answer(
+        message,
+        f"⏳ Игрок **{target['name']}** (`#{gid}`) временно заблокирован на **{dur_txt}**.\n"
+        f"Причина: _{reason}_",
+        parse_mode="Markdown",
+    )
+    await safe_send(
+        bot,
+        target_tg_id,
+        f"⏳ Вы получили временный бан на **{dur_txt}**.\nПричина: {reason}",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("untempban"))
+async def cmd_untempban(message: Message):
+    uid = message.from_user.id
+    if not is_admin(uid, 2):
+        await safe_answer(message, "⛔ Снимать временные баны можно со 2 ранга администратора.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await safe_answer(message, "Формат: `/untempban <игровой_ID>`", parse_mode="Markdown")
+        return
+
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await safe_answer(message, "Игровой ID должен быть числом.")
+        return
+
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок `#{gid}` не найден.", parse_mode="Markdown")
+        return
+
+    target["tempban_until"] = 0.0
+    target["tempban_reason"] = ""
+    save_state()
+    await safe_answer(message, f"✅ Временный бан с игрока **{target['name']}** (`#{gid}`) снят.", parse_mode="Markdown")
+
 
 
 # --- ДОПОЛНИТЕЛЬНЫЕ КНОПКИ, ФРАКЦИИ, СЕМЬЯ, МАГАЗИНЫ, ТОП И АДМИНКА ---
@@ -1934,6 +2112,166 @@ async def cmd_bank(message: Message):
         p["money"] += amt
         save_state()
         await safe_answer(message, f"💵 Снято с банка **+{amt} ₽**. Наличные: **{p['money']} ₽**.", reply_markup=main_kb(uid), parse_mode="Markdown")
+
+
+@dp.message(Command("resetplayer"))
+async def cmd_resetplayer(message: Message, bot: Bot):
+    uid = message.from_user.id
+    if not is_admin(uid, 5):
+        await safe_answer(message, "⛔ Обнулять аккаунты игроков может только 5 ранг администратора или создатель.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await safe_answer(message, "Формат: `/resetplayer <игровой_ID>`", parse_mode="Markdown")
+        return
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await safe_answer(message, "Игровой ID должен быть числом.")
+        return
+
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок `#{gid}` не найден.", parse_mode="Markdown")
+        return
+
+    target_tg_id = int(target["tg_id"])
+    if is_creator(target_tg_id):
+        await safe_answer(message, "Нельзя обнулить аккаунт создателя.")
+        return
+
+    old_name = str(target.get("name") or f"Игрок_{target_tg_id}")
+    old_fam_id = target.get("family_id")
+    if old_fam_id and str(old_fam_id) in families:
+        fdata = families[str(old_fam_id)]
+        members = list(fdata.get("members") or [])
+        if target_tg_id in members:
+            members.remove(target_tg_id)
+            fdata["members"] = members
+        if fdata.get("owner_uid") == target_tg_id:
+            if members:
+                fdata["owner_uid"] = members[0]
+                next_u = users.get(str(members[0]))
+                fdata["owner_name"] = next_u.get("name") if isinstance(next_u, dict) else "Глава"
+            else:
+                del families[str(old_fam_id)]
+
+    for b in businesses.values():
+        if isinstance(b, dict) and b.get("owner_uid") == target_tg_id:
+            b["owner_uid"] = None
+            b["owner_name"] = None
+            b["cash"] = 0
+            b["last_collect"] = 0.0
+
+    fresh = normalize_player({"name": old_name, "game_id": gid}, target_tg_id)
+    fresh["money"] = 0
+    fresh["bank"] = 0
+    users[str(target_tg_id)] = fresh
+    save_state()
+
+    await safe_answer(
+        message,
+        f"♻️ Прогресс игрока **{old_name}** (`#{gid}`) полностью обнулён (баланс `0 ₽`, 1 уровень, без имущества/фракции/семьи).",
+        parse_mode="Markdown",
+    )
+    await safe_send(
+        bot,
+        target_tg_id,
+        "♻️ Ваш игровой прогресс был обнулён администрацией.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("wipeall"))
+async def cmd_wipeall(message: Message):
+    uid = message.from_user.id
+    if not is_creator(uid):
+        await safe_answer(message, "⛔ Полный вайп сервера доступен только создателю.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or parts[1].strip().upper() != "CONFIRM":
+        await safe_answer(
+            message,
+            "⚠️ **Внимание!** Это полностью очистит базу игроков, бизнесов, семей, промокодов и тикетов.\n"
+            "Для подтверждения введите: `/wipeall CONFIRM`",
+            parse_mode="Markdown",
+        )
+        return
+
+    creator_backup = None
+    if CREATOR_ID and str(CREATOR_ID) in users and isinstance(users[str(CREATOR_ID)], dict):
+        creator_backup = dict(users[str(CREATOR_ID)])
+
+    users.clear()
+    faction_apps.clear()
+    families.clear()
+    promocodes.clear()
+    support_tickets.clear()
+    businesses.clear()
+    for bid, bdef in DEFAULT_BUSINESSES.items():
+        businesses[bid] = dict(bdef)
+
+    if creator_backup:
+        users[str(CREATOR_ID)] = normalize_player(creator_backup, CREATOR_ID)
+
+    save_state()
+    await safe_answer(
+        message,
+        "🧹 **Полный вайп выполнен!** База сервера сброшена к чистому состоянию.",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("tech"))
+@dp.message(Command("maint"))
+async def cmd_maintenance(message: Message):
+    global maintenance_mode, maintenance_reason
+    uid = message.from_user.id
+    if not is_admin(uid, 4):
+        await safe_answer(message, "⛔ Управлять режимом технических работ можно с 4 ранга администратора.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) == 1:
+        status_txt = "ВКЛЮЧЕНЫ 🛠" if maintenance_mode else "ВЫКЛЮЧЕНЫ ✅"
+        await safe_answer(
+            message,
+            f"🛠 **Режим технических работ:** **{status_txt}**\n"
+            f"Причина: _{maintenance_reason}_\n\n"
+            "Включить: `/tech on [причина]`\n"
+            "Выключить: `/tech off`",
+            parse_mode="Markdown",
+        )
+        return
+
+    mode_arg = parts[1].strip().lower()
+    if mode_arg in {"on", "1", "true", "да"}:
+        maintenance_mode = True
+        if len(parts) == 3 and parts[2].strip():
+            maintenance_reason = parts[2].strip()
+        save_state()
+        await safe_answer(
+            message,
+            f"🛠 **Технические работы ВКЛЮЧЕНЫ.**\n"
+            f"Причина: _{maintenance_reason}_\n"
+            "Игрокам бот будет отвечать уведомлением о техработах, админы 1+ ранга и создатель продолжают работу.",
+            parse_mode="Markdown",
+        )
+    elif mode_arg in {"off", "0", "false", "нет"}:
+        maintenance_mode = False
+        save_state()
+        await safe_answer(
+            message,
+            "✅ **Технические работы ВЫКЛЮЧЕНЫ.** Бот снова доступен всем игрокам.",
+            parse_mode="Markdown",
+        )
+    else:
+        await safe_answer(
+            message,
+            "Формат: `/tech on [причина]` или `/tech off`",
+            parse_mode="Markdown",
+        )
 
 
 async def main() -> None:
