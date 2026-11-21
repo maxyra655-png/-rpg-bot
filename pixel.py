@@ -471,7 +471,39 @@ async def check_cb_not_banned(p: dict, callback: CallbackQuery) -> bool:
 dp = Dispatcher()
 
 
+class BanMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        if isinstance(event, Update):
+            user = None
+            if event.message and event.message.from_user:
+                user = event.message.from_user
+            elif event.callback_query and event.callback_query.from_user:
+                user = event.callback_query.from_user
+
+            if user and not is_owner(user.id):
+                p = users.get(str(user.id))
+                if is_banned(p):
+                    reason = p.get("ban_reason") or "причина не указана"
+                    if event.message:
+                        await event.message.answer(
+                            f"🚫 Ваш аккаунт заблокирован.\nПричина: {reason}",
+                            parse_mode=None,
+                        )
+                    elif event.callback_query:
+                        await event.callback_query.answer(
+                            f"🚫 Аккаунт забанен. Причина: {reason}",
+                            show_alert=True,
+                        )
+                    return
+
+        return await handler(event, data)
+
+
+dp.update.middleware(BanMiddleware())
+
+
 @dp.message(CommandStart())
+
 async def cmd_start(message: Message):
     uid = message.from_user.id
     p = get_player(uid, message.from_user.full_name)
