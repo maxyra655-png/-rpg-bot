@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import boss
 import time
 
 from aiogram import Bot, Dispatcher, F
@@ -69,6 +70,7 @@ FACTIONS = {
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+dp.include_router(boss.router)
 
 users: dict[int, dict] = {}             # tg_id -> данные игрока
 game_to_tg: dict[int, int] = {}           # game_id -> tg_id
