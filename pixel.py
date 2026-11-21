@@ -37,6 +37,7 @@ FACTIONS = {
     "dps": {"name": "🚓 УГИБДД (ДПС)", "pay": (380, 560), "min_lvl": 3, "type": "gos"},
     "pps": {"name": "👮 УМВД (ППС)", "pay": (360, 540), "min_lvl": 3, "type": "gos"},
     "mchs": {"name": "🚒 МЧС России", "pay": (350, 520), "min_lvl": 3, "type": "gos"},
+    "fsb": {"name": "🛡 ФСБ России", "pay": (460, 680), "min_lvl": 5, "type": "gos"},
     "opg_sun": {"name": "🔫 ОПГ «Солнцевские»", "pay": (320, 500), "min_lvl": 2, "type": "opg"},
     "opg_orekh": {"name": "🔪 ОПГ «Ореховские»", "pay": (320, 500), "min_lvl": 2, "type": "opg"},
 }
@@ -80,38 +81,59 @@ state: dict = load_state()
 users: dict[str, dict] = state["users"]
 
 
+def normalize_player(p: dict, tg_id: int, full_name: str = "") -> dict:
+    p["tg_id"] = tg_id
+    if full_name:
+        p["name"] = full_name
+    p.setdefault("money", 1000)
+    p.setdefault("lvl", 1)
+    p.setdefault("xp", 0)
+    p.setdefault("wanted", 0)
+    p.setdefault("faction", "none")
+    if p["faction"] not in FACTIONS:
+        p["faction"] = "none"
+    p.setdefault("rank", 1)
+    p.setdefault("leader_of", None)
+    if p["leader_of"] not in FACTIONS or p["leader_of"] == "none":
+        p["leader_of"] = None
+    p.setdefault("is_admin", False)
+    p.setdefault("is_media", False)
+    p.setdefault("car", "none")
+    p.setdefault("house", "none")
+    p.setdefault("city", "arzamas")
+    p.setdefault("last_shift", 0.0)
+    p.setdefault("last_crime", 0.0)
+    p.setdefault("last_daily", 0.0)
+    return p
+
+
 def get_player(tg_id: int, full_name: str = "") -> dict:
     key = str(tg_id)
     if key not in users:
         gid = int(state.get("next_id", START_GAME_ID))
         state["next_id"] = gid + 1
-        users[key] = {
-            "tg_id": tg_id,
-            "game_id": gid,
-            "name": full_name or f"Гражданин_{gid}",
-            "money": 1000,
-            "lvl": 1,
-            "xp": 0,
-            "wanted": 0,
-            "faction": "none",
-            "rank": 1,
-            "car": "none",
-            "house": "none",
-            "city": "arzamas",
-            "last_shift": 0.0,
-            "last_crime": 0.0,
-            "last_daily": 0.0,
-        }
+        users[key] = normalize_player(
+            {
+                "tg_id": tg_id,
+                "game_id": gid,
+                "name": full_name or f"Гражданин_{gid}",
+            },
+            tg_id,
+            full_name,
+        )
         save_state()
     else:
-        users[key]["tg_id"] = tg_id
-        if full_name:
-            users[key]["name"] = full_name
+        normalize_player(users[key], tg_id, full_name)
     return users[key]
 
 
 def find_by_game_id(game_id: int) -> dict | None:
-    for u in users.values():
+    for key, u in users.items():
+        try:
+            tg_id = int(u.get("tg_id") or key)
+        except ValueError:
+            tg_id = 0
+        normalize_player(u, tg_id)
         if u.get("game_id") == game_id:
             return u
     return None
@@ -128,8 +150,48 @@ def add_xp(p: dict, amount: int) -> bool:
     return up
 
 
-def is_admin(user_id: int | None) -> bool:
+def is_owner(user_id: int | None) -> bool:
     return user_id == OWNER_ID
+
+
+def is_admin(user_id: int | None) -> bool:
+    if is_owner(user_id):
+        return True
+    if not user_id:
+        return False
+    u = users.get(str(user_id))
+    return bool(u and u.get("is_admin"))
+
+
+def is_media(user_id: int | None) -> bool:
+    if is_admin(user_id):
+        return True
+    if not user_id:
+        return False
+    u = users.get(str(user_id))
+    return bool(u and u.get("is_media"))
+
+
+def is_leader(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    u = users.get(str(user_id))
+    return bool(u and u.get("leader_of"))
+
+
+def get_roles_badges(p: dict) -> list[str]:
+    badges = []
+    uid = p.get("tg_id")
+    if is_owner(uid):
+        badges.append("👑 Создатель")
+    elif p.get("is_admin"):
+        badges.append("🛡 Администратор")
+    if p.get("is_media"):
+        badges.append("🎬 Медиа-админ")
+    if p.get("leader_of") in FACTIONS and p.get("leader_of") != "none":
+        fac_name = FACTIONS[p["leader_of"]]["name"]
+        badges.append(f"💼 Лидер ({fac_name})")
+    return badges
 
 
 def main_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
@@ -151,8 +213,15 @@ def main_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏆 Топ области", callback_data="m_top"),
         ],
     ]
+    extra_row = []
+    if is_leader(user_id):
+        extra_row.append(InlineKeyboardButton(text="👔 Лидерка", callback_data="m_leader"))
+    if is_media(user_id) and not is_admin(user_id):
+        extra_row.append(InlineKeyboardButton(text="🎬 Медиа", callback_data="m_media"))
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="m_admin")])
+        extra_row.append(InlineKeyboardButton(text="🛠 Админка", callback_data="m_admin"))
+    if extra_row:
+        rows.append(extra_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -163,7 +232,8 @@ def format_passport(p: dict) -> str:
     city = CITIES.get(p["city"], CITIES["arzamas"])
     stars = "⭐" * p["wanted"] if p["wanted"] > 0 else "Чист"
     need_xp = p["lvl"] * 120
-    role_line = "👑 Статус: **Создатель проекта**\n" if is_admin(p.get("tg_id")) else ""
+    badges = get_roles_badges(p)
+    role_line = f"🎖 Должности: **{', '.join(badges)}**\n" if badges else ""
     return (
         f"🪪 **Паспорт гражданина РФ**\n"
         f"{role_line}"
@@ -178,15 +248,48 @@ def format_passport(p: dict) -> str:
     )
 
 
-def admin_help_text() -> str:
+def leader_panel_text(p: dict) -> str:
+    fac_id = p.get("leader_of")
+    fac = FACTIONS.get(fac_id or "none", FACTIONS["none"])
+    members = [u for u in users.values() if u.get("faction") == fac_id]
     return (
-        "🛠 **Панель создателя CRMP**\n"
-        f"👑 Твой TG ID: `{OWNER_ID}` | Игроков в базе: `{len(users)}`\n\n"
-        "`/givemoney <ID> <сумма>` — выдать/снять рубли\n"
-        "`/setlvl <ID> <уровень>` — поставить уровень\n"
-        "`/clearwanted <ID>` — снять розыск игроку\n"
-        "`/announce <текст>` — объявление всем игрокам"
+        f"👔 **Панель лидера фракции**\n"
+        f"🏛 Организация: **{fac['name']}**\n"
+        f"👥 Состав в организации: **{len(members)} чел.**\n"
+        f"💵 Бонус лидера к смене: **+150 ₽**\n\n"
+        f"`/giveprem <игровой_ID> <сумма>` — выдать премию игроку (до 5 000 ₽)"
     )
+
+
+def media_panel_text() -> str:
+    return (
+        "🎬 **Панель медиа-администратора**\n\n"
+        "`/announce <текст>` — объявление игрокам\n"
+        "`/mediaprize <игровой_ID> <сумма>` — выдать приз за конкурс/ролик (до 15 000 ₽)"
+    )
+
+
+def admin_help_text(user_id: int | None) -> str:
+    lines = [
+        "🛠 **Панель администрации CRMP**",
+        f"Игроков в базе: `{len(users)}`\n",
+        "`/givemoney <ID> <сумма>` — выдать/снять рубли",
+        "`/setlvl <ID> <уровень>` — поставить уровень",
+        "`/clearwanted <ID>` — снять розыск игроку",
+        "`/announce <текст>` — объявление всем игрокам",
+        "`/mediaprize <ID> <сумма>` — выдать медиа-приз",
+    ]
+    if is_owner(user_id):
+        fac_keys = ", ".join(f"`{k}`" for k in FACTIONS if k != "none")
+        lines.extend(
+            [
+                "\n👑 **Команды владельца:**",
+                "`/setadmin <ID> <0|1>` — выдать/снять админку",
+                "`/setmedia <ID> <0|1>` — выдать/снять медиа-админку",
+                f"`/setleader <ID> <фракция|none>` — назначить/снять лидера\nФракции: {fac_keys}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 dp = Dispatcher()
@@ -248,18 +351,115 @@ async def cmd_pay(message: Message):
     )
 
 
-# --- АДМИН-КОМАНДЫ ---
+# --- КОМАНДЫ ЛИДЕРА ---
+@dp.message(Command("leader"))
+async def cmd_leader_panel(message: Message):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    if not is_leader(uid):
+        await message.answer("⛔ Вы не являетесь лидером ни одной фракции.")
+        return
+    await message.answer(leader_panel_text(p), reply_markup=main_kb(uid), parse_mode="Markdown")
+
+
+@dp.message(Command("giveprem"))
+async def cmd_giveprem(message: Message):
+    uid = message.from_user.id
+    leader = get_player(uid, message.from_user.full_name)
+    if not is_leader(uid):
+        await message.answer("⛔ Команда доступна только лидерам фракций.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Формат: `/giveprem <игровой_ID> <сумма>`", parse_mode="Markdown")
+        return
+    try:
+        gid, amount = int(parts[1]), int(parts[2])
+    except ValueError:
+        await message.answer("Нужны целые числа.")
+        return
+
+    if amount <= 0 or amount > 5000:
+        await message.answer("Сумма премии должна быть от `1` до `5000` ₽.", parse_mode="Markdown")
+        return
+
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    target["money"] += amount
+    save_state()
+    await message.answer(
+        f"💼 Лидер **{leader['name']}** выдал премию **{amount} ₽** игроку **{target['name']}** (`#{gid}`).",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+# --- КОМАНДЫ МЕДИА-АДМИНА ---
+@dp.message(Command("media"))
+async def cmd_media_panel(message: Message):
+    uid = message.from_user.id
+    get_player(uid, message.from_user.full_name)
+    if not is_media(uid):
+        await message.answer("⛔ Нет прав медиа-администратора.")
+        return
+    await message.answer(media_panel_text(), reply_markup=main_kb(uid), parse_mode="Markdown")
+
+
+@dp.message(Command("mediaprize"))
+async def cmd_mediaprize(message: Message):
+    uid = message.from_user.id
+    get_player(uid, message.from_user.full_name)
+    if not is_media(uid):
+        await message.answer("⛔ Нет прав медиа-администратора.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Формат: `/mediaprize <игровой_ID> <сумма>`", parse_mode="Markdown")
+        return
+    try:
+        gid, amount = int(parts[1]), int(parts[2])
+    except ValueError:
+        await message.answer("Нужны целые числа.")
+        return
+
+    if amount <= 0 or amount > 15000:
+        await message.answer("Сумма медиа-приза должна быть от `1` до `15000` ₽.", parse_mode="Markdown")
+        return
+
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    target["money"] += amount
+    save_state()
+    await message.answer(
+        f"🎬 Выдан медиа-приз **{amount} ₽** игроку **{target['name']}** (`#{gid}`).",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+# --- АДМИН-КОМАНДЫ И КОМАНДЫ ВЛАДЕЛЬЦА ---
 @dp.message(Command("admin"))
 async def cmd_admin_help(message: Message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    get_player(uid, message.from_user.full_name)
+    if not is_admin(uid):
         await message.answer("⛔ Нет доступа к админ-панели.")
         return
-    await message.answer(admin_help_text(), parse_mode="Markdown")
+    await message.answer(admin_help_text(uid), reply_markup=main_kb(uid), parse_mode="Markdown")
 
 
 @dp.message(Command("givemoney"))
 async def cmd_givemoney(message: Message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not is_admin(uid):
         await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
@@ -282,7 +482,8 @@ async def cmd_givemoney(message: Message):
 
 @dp.message(Command("setlvl"))
 async def cmd_setlvl(message: Message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not is_admin(uid):
         await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
@@ -306,7 +507,8 @@ async def cmd_setlvl(message: Message):
 
 @dp.message(Command("clearwanted"))
 async def cmd_admin_clearwanted(message: Message):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    if not is_admin(uid):
         await message.answer("⛔ Нет доступа.")
         return
     parts = (message.text or "").split()
@@ -327,9 +529,117 @@ async def cmd_admin_clearwanted(message: Message):
     await message.answer(f"✅ Розыск игрока `{gid}` снят.", parse_mode="Markdown")
 
 
+@dp.message(Command("setadmin"))
+async def cmd_setadmin(message: Message):
+    uid = message.from_user.id
+    if not is_owner(uid):
+        await message.answer("⛔ Выдавать и снимать админки может только создатель проекта.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Формат: `/setadmin <игровой_ID> <0|1>`", parse_mode="Markdown")
+        return
+    try:
+        gid, flag = int(parts[1]), int(parts[2])
+    except ValueError:
+        await message.answer("Нужны целые числа.")
+        return
+    if flag not in (0, 1):
+        await message.answer("Укажи `1` (выдать) или `0` (снять).", parse_mode="Markdown")
+        return
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+    target["is_admin"] = bool(flag)
+    save_state()
+    status = "выдана админка" if flag else "снята админка"
+    await message.answer(f"👑 Игроку `{gid}` ({target['name']}) {status}.", parse_mode="Markdown")
+
+
+@dp.message(Command("setmedia"))
+async def cmd_setmedia(message: Message):
+    uid = message.from_user.id
+    if not is_owner(uid):
+        await message.answer("⛔ Выдавать и снимать медиа-админки может только создатель проекта.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("Формат: `/setmedia <игровой_ID> <0|1>`", parse_mode="Markdown")
+        return
+    try:
+        gid, flag = int(parts[1]), int(parts[2])
+    except ValueError:
+        await message.answer("Нужны целые числа.")
+        return
+    if flag not in (0, 1):
+        await message.answer("Укажи `1` (выдать) или `0` (снять).", parse_mode="Markdown")
+        return
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+    target["is_media"] = bool(flag)
+    save_state()
+    status = "выдана медиа-админка" if flag else "снята медиа-админка"
+    await message.answer(f"🎬 Игроку `{gid}` ({target['name']}) {status}.", parse_mode="Markdown")
+
+
+@dp.message(Command("setleader"))
+async def cmd_setleader(message: Message):
+    uid = message.from_user.id
+    if not is_owner(uid):
+        await message.answer("⛔ Назначать и снимать лидеров может только создатель проекта.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        fac_keys = ", ".join(f"`{k}`" for k in FACTIONS if k != "none")
+        await message.answer(
+            f"Формат: `/setleader <игровой_ID> <фракция|none>`\nФракции: {fac_keys}",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        gid = int(parts[1])
+    except ValueError:
+        await message.answer("Игровой ID должен быть числом.")
+        return
+    fac_id = parts[2].strip().lower()
+    if fac_id != "none" and fac_id not in FACTIONS:
+        fac_keys = ", ".join(f"`{k}`" for k in FACTIONS if k != "none")
+        await message.answer(f"Неизвестная фракция. Доступны: {fac_keys} или `none`.", parse_mode="Markdown")
+        return
+
+    target = find_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким игровым ID не найден.")
+        return
+
+    if fac_id == "none":
+        target["leader_of"] = None
+        save_state()
+        await message.answer(f"👔 Игрок `{gid}` ({target['name']}) снят с лидерки.", parse_mode="Markdown")
+        return
+
+    for u in users.values():
+        if u.get("leader_of") == fac_id and u.get("game_id") != gid:
+            u["leader_of"] = None
+
+    target["leader_of"] = fac_id
+    target["faction"] = fac_id
+    target["rank"] = 10
+    save_state()
+    await message.answer(
+        f"👔 Игрок `{gid}` ({target['name']}) назначен лидером фракции **{FACTIONS[fac_id]['name']}**!",
+        parse_mode="Markdown",
+    )
+
+
 @dp.message(Command("announce"))
 async def cmd_announce(message: Message, bot: Bot):
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    get_player(uid, message.from_user.full_name)
+    if not is_media(uid):
         await message.answer("⛔ Нет доступа.")
         return
 
@@ -339,7 +649,10 @@ async def cmd_announce(message: Message, bot: Bot):
         return
 
     safe_body = html.escape(raw_text[1].strip())
-    text = f"📢 <b>ОБЪЯВЛЕНИЕ АДМИНИСТРАЦИИ</b>\n\n{safe_body}"
+    header = "📢 <b>ОБЪЯВЛЕНИЕ АДМИНИСТРАЦИИ</b>"
+    if not is_admin(uid) and is_media(uid):
+        header = "🎬 <b>МЕДИА-ОБЪЯВЛЕНИЕ</b>"
+    text = f"{header}\n\n{safe_body}"
 
     sent_ok = 0
     sent_fail = 0
@@ -371,10 +684,32 @@ async def cmd_announce(message: Message, bot: Bot):
 # --- МЕНЮ И КНОПКИ ---
 @dp.callback_query(F.data == "m_admin")
 async def cb_admin(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    uid = callback.from_user.id
+    if not is_admin(uid):
         await callback.answer("⛔ Нет прав администратора", show_alert=True)
         return
-    await callback.message.answer(admin_help_text(), reply_markup=main_kb(callback.from_user.id), parse_mode="Markdown")
+    await callback.message.answer(admin_help_text(uid), reply_markup=main_kb(uid), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "m_media")
+async def cb_media(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not is_media(uid):
+        await callback.answer("⛔ Нет прав медиа-администратора", show_alert=True)
+        return
+    await callback.message.answer(media_panel_text(), reply_markup=main_kb(uid), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "m_leader")
+async def cb_leader(callback: CallbackQuery):
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    if not is_leader(uid):
+        await callback.answer("⛔ Вы не лидер фракции", show_alert=True)
+        return
+    await callback.message.answer(leader_panel_text(p), reply_markup=main_kb(uid), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -457,6 +792,8 @@ async def cb_join_fac(callback: CallbackQuery):
         await callback.answer("В госструктуры с розыском не принимают!", show_alert=True)
         return
     p["faction"] = fid
+    if p.get("leader_of") and p["leader_of"] != fid:
+        p["leader_of"] = None
     save_state()
     await callback.message.answer(
         f"✅ Ты вступил в **{info['name']}**!",
@@ -478,7 +815,8 @@ async def cb_do_shift(callback: CallbackQuery):
 
     fac = FACTIONS.get(p["faction"], FACTIONS["none"])
     house_bonus = HOUSES.get(p["house"], HOUSES["none"])["pay_bonus"]
-    pay = random.randint(*fac["pay"]) + house_bonus + (p["rank"] * 15)
+    leader_bonus = 150 if p.get("leader_of") == p["faction"] and p["faction"] != "none" else 0
+    pay = random.randint(*fac["pay"]) + house_bonus + leader_bonus + (p["rank"] * 15)
     xp_gain = random.randint(25, 45)
 
     p["last_shift"] = now
