@@ -27,6 +27,12 @@ MEDIA_REWARD_COOLDOWN = 300
 MEDIA_REWARD_COINS = 100
 MEDIA_REWARD_XP = 25
 
+DAILY_COOLDOWN = 86400
+DAILY_STREAK_WINDOW = 172800
+QUEST_TARGET_ACTIONS = 5
+QUEST_REWARD_COINS = 120
+QUEST_REWARD_XP = 30
+
 MAX_HP = 100
 START_GAME_ID = 1001
 DATA_FILE = "data.json"
@@ -85,6 +91,10 @@ def default_user_profile(tg_id: int, gid: int, name: str = "Игрок") -> dict
         "last_work": 0.0,
         "last_leader_bonus": 0.0,
         "last_media_reward": 0.0,
+        "last_daily": 0.0,
+        "daily_streak": 0,
+        "quests_done": 0,
+        "quest_claimed": False,
         "used_promos": [],
         "items": [],
         "power_bonus": 0,
@@ -150,6 +160,10 @@ def load_data() -> None:
             profile["last_work"] = float(v.get("last_work", 0.0))
             profile["last_leader_bonus"] = float(v.get("last_leader_bonus", 0.0))
             profile["last_media_reward"] = float(v.get("last_media_reward", 0.0))
+            profile["last_daily"] = float(v.get("last_daily", 0.0))
+            profile["daily_streak"] = int(v.get("daily_streak", 0))
+            profile["quests_done"] = int(v.get("quests_done", 0))
+            profile["quest_claimed"] = bool(v.get("quest_claimed", False))
             raw_used = v.get("used_promos")
             profile["used_promos"] = [str(x).upper() for x in raw_used] if isinstance(raw_used, list) else []
             profile["items"] = list(v.get("items") or [])
@@ -247,6 +261,10 @@ class GameStates(StatesGroup):
     waiting_create_promo = State()
     waiting_media_reward_gid = State()
     waiting_activate_promo = State()
+    waiting_transfer_input = State()
+    waiting_duel_input = State()
+    waiting_slots_bet = State()
+    waiting_lookup_gid = State()
 
 
 def is_owner(tg_id: int) -> bool:
@@ -283,6 +301,18 @@ def get_user(tg_id: int, name: str = "Игрок") -> dict:
             changed = True
         if "last_media_reward" not in u:
             u["last_media_reward"] = 0.0
+            changed = True
+        if "last_daily" not in u:
+            u["last_daily"] = 0.0
+            changed = True
+        if "daily_streak" not in u:
+            u["daily_streak"] = 0
+            changed = True
+        if "quests_done" not in u:
+            u["quests_done"] = 0
+            changed = True
+        if "quest_claimed" not in u:
+            u["quest_claimed"] = False
             changed = True
         if not isinstance(u.get("used_promos"), list):
             u["used_promos"] = []
@@ -339,6 +369,7 @@ def format_profile(user: dict, note: str = "") -> str:
     xp = user.get("xp", 0)
     needed_xp = level * 50
     max_hp = get_max_hp(user)
+    streak = int(user.get("daily_streak", 0))
 
     if is_owner(user["tg_id"]):
         role_badge = "👑 Владелец"
@@ -359,6 +390,7 @@ def format_profile(user: dict, note: str = "") -> str:
         f"💰 Монеты: **{user.get('coins', 0)}**\n"
         f"❤️ HP: **{user.get('hp', max_hp)}/{max_hp}**\n"
         f"⚡ Бонус силы: **+{user.get('power_bonus', 0)}**\n"
+        f"🔥 Серия входов: **{streak}** дн.\n"
         f"🎒 Рюкзак: *{items_text}*"
     )
     if note:
@@ -377,6 +409,10 @@ def main_keyboard(tg_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏴 Фракция", callback_data="menu_faction"),
         ],
         [
+            InlineKeyboardButton(text="📅 Ежедневка", callback_data="act_daily"),
+            InlineKeyboardButton(text="🎮 Игровые фичи", callback_data="menu_extra"),
+        ],
+        [
             InlineKeyboardButton(text="🎟 Промокод", callback_data="act_promo"),
             InlineKeyboardButton(text="🏆 Топ игроков", callback_data="menu_top"),
         ],
@@ -389,6 +425,25 @@ def main_keyboard(tg_id: int) -> InlineKeyboardMarkup:
     if is_admin(tg_id):
         rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def extra_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💸 Перевод по ID", callback_data="act_transfer"),
+                InlineKeyboardButton(text="⚔️ Дуэль по ID", callback_data="act_duel"),
+            ],
+            [
+                InlineKeyboardButton(text="🎰 Слоты", callback_data="act_slots"),
+                InlineKeyboardButton(text="📜 Квест дня", callback_data="menu_quest"),
+            ],
+            [
+                InlineKeyboardButton(text="🔍 Найти по ID", callback_data="act_lookup"),
+                InlineKeyboardButton(text="⬅️ В профиль", callback_data="back_main"),
+            ],
+        ]
+    )
 
 
 def shop_keyboard() -> InlineKeyboardMarkup:
@@ -538,6 +593,7 @@ async def on_work(callback: CallbackQuery):
     max_hp = get_max_hp(user)
     user["coins"] = user.get("coins", 0) + earned
     user["hp"] = max(1, min(max_hp, user.get("hp", max_hp) - hp_loss))
+    user["quests_done"] = int(user.get("quests_done", 0)) + 1
     leveled = add_xp(user, 15)
     save_data()
 
@@ -573,6 +629,7 @@ async def on_dice(callback: CallbackQuery):
         user["coins"] -= bet
         note = f"🎲 Выпало **{roll_val}**. Не повезло: потеряно **{bet}** монет."
 
+    user["quests_done"] = int(user.get("quests_done", 0)) + 1
     save_data()
     await safe_edit_or_send(callback, format_profile(user, note), main_keyboard(uid))
     await callback.answer(f"Выпало {roll_val}")
@@ -833,6 +890,363 @@ async def on_menu_top(callback: CallbackQuery):
     await callback.answer()
 
 
+# --- ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ИГРОКОВ ---
+
+@dp.callback_query(F.data == "menu_extra")
+async def on_menu_extra(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    uid = callback.from_user.id
+    user = get_user(uid, callback.from_user.first_name)
+    text = (
+        "🎮 **Игровые функции**\n\n"
+        f"💰 Баланс: **{user.get('coins', 0)}** монет | 🆔 Твой ID: **`{user['game_id']}`**\n"
+        "Выбери действие:"
+    )
+    await safe_edit_or_send(callback, text, extra_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "act_daily")
+async def on_daily(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user = get_user(uid, callback.from_user.first_name)
+    now = time.time()
+    last_daily = float(user.get("last_daily", 0.0))
+    elapsed = now - last_daily
+
+    if last_daily > 0 and elapsed < DAILY_COOLDOWN:
+        rem = int(DAILY_COOLDOWN - elapsed)
+        hours = rem // 3600
+        mins = (rem % 3600) // 60
+        await callback.answer(f"⏳ Ежедневка будет доступна через {hours}ч {mins}м", show_alert=True)
+        return
+
+    if last_daily > 0 and elapsed <= DAILY_STREAK_WINDOW:
+        streak = int(user.get("daily_streak", 0)) + 1
+    else:
+        streak = 1
+
+    streak_capped = min(streak, 10)
+    reward_coins = 50 + (streak_capped - 1) * 15
+    reward_xp = 15 + (streak_capped - 1) * 5
+
+    user["last_daily"] = now
+    user["daily_streak"] = streak
+    user["coins"] = int(user.get("coins", 0)) + reward_coins
+    leveled = add_xp(user, reward_xp)
+    save_data()
+
+    note = (
+        f"📅 **Ежедневный бонус получен!**\n"
+        f"🔥 Серия входов: **{streak}** дн.\n"
+        f"Награда: **+{reward_coins}** монет и **+{reward_xp} XP**."
+    )
+    if leveled:
+        note += f"\n🎉 **Новый уровень: {user['level']}!**"
+
+    await safe_edit_or_send(callback, format_profile(user, note), main_keyboard(uid))
+    await callback.answer(f"+{reward_coins} монет")
+
+
+@dp.callback_query(F.data == "act_transfer")
+async def on_transfer_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GameStates.waiting_transfer_input)
+    await callback.message.answer(
+        "💸 Введи **игровой ID** получателя и **сумму монет** через пробел:\n"
+        "Пример: `1002 150`",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@dp.message(GameStates.waiting_transfer_input)
+async def on_transfer_input(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    sender = get_user(uid, message.from_user.first_name)
+    parts = (message.text or "").strip().split()
+    if len(parts) != 2:
+        await message.answer("Формат: `<игровой_ID> <сумма>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_gid = int(parts[0])
+        amount = int(parts[1])
+    except ValueError:
+        await message.answer("ID и сумма должны быть целыми числами.")
+        return
+
+    if amount <= 0:
+        await message.answer("Сумма перевода должна быть больше нуля.")
+        return
+
+    if target_gid == sender["game_id"]:
+        await message.answer("Нельзя перевести монеты самому себе.")
+        return
+
+    target = get_user_by_game_id(target_gid)
+    if not target:
+        await message.answer("Игрок с таким ID не найден.")
+        return
+
+    if int(sender.get("coins", 0)) < amount:
+        await message.answer("Недостаточно монет на балансе.")
+        return
+
+    sender["coins"] = int(sender.get("coins", 0)) - amount
+    target["coins"] = int(target.get("coins", 0)) + amount
+    save_data()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Переведено **{amount}** монет игроку **{target['name']}** (`ID: {target_gid}`).\n"
+        f"💰 Твой новый баланс: **{sender['coins']}**.",
+        parse_mode="Markdown",
+    )
+    try:
+        await bot.send_message(
+            target["tg_id"],
+            f"💸 Ты получил перевод **+{amount}** монет от **{sender['name']}** (`ID: {sender['game_id']}`).",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "act_duel")
+async def on_duel_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GameStates.waiting_duel_input)
+    await callback.message.answer(
+        "⚔️ Введи **игровой ID** соперника и **ставку монет** через пробел:\n"
+        "Пример: `1002 50`",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@dp.message(GameStates.waiting_duel_input)
+async def on_duel_input(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    p1 = get_user(uid, message.from_user.first_name)
+    parts = (message.text or "").strip().split()
+    if len(parts) != 2:
+        await message.answer("Формат: `<игровой_ID> <ставка>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_gid = int(parts[0])
+        bet = int(parts[1])
+    except ValueError:
+        await message.answer("ID и ставка должны быть целыми числами.")
+        return
+
+    if bet < 10:
+        await message.answer("Минимальная ставка для дуэли — 10 монет.")
+        return
+
+    if target_gid == p1["game_id"]:
+        await message.answer("Нельзя вызвать на дуэль самого себя.")
+        return
+
+    p2 = get_user_by_game_id(target_gid)
+    if not p2:
+        await message.answer("Соперник с таким ID не найден.")
+        return
+
+    if int(p1.get("coins", 0)) < bet:
+        await message.answer("У тебя не хватает монет для этой ставки.")
+        return
+
+    if int(p2.get("coins", 0)) < bet:
+        await message.answer("У соперника не хватает монет для этой ставки.")
+        return
+
+    fac1 = FACTIONS.get(p1.get("faction") or "")
+    fac2 = FACTIONS.get(p2.get("faction") or "")
+    power1 = (
+        int(p1.get("level", 1)) * 4
+        + int(p1.get("power_bonus", 0))
+        + (fac1["work_bonus"] if fac1 else 0)
+        + random.randint(1, 25)
+    )
+    power2 = (
+        int(p2.get("level", 1)) * 4
+        + int(p2.get("power_bonus", 0))
+        + (fac2["work_bonus"] if fac2 else 0)
+        + random.randint(1, 25)
+    )
+
+    if power1 >= power2:
+        winner, loser = p1, p2
+    else:
+        winner, loser = p2, p1
+
+    winner["coins"] = int(winner.get("coins", 0)) + bet
+    loser["coins"] = int(loser.get("coins", 0)) - bet
+    leveled = add_xp(winner, 15)
+    save_data()
+    await state.clear()
+
+    lvl_text = f"\n🎉 **{winner['name']}** поднял уровень до **{winner['level']}**!" if leveled else ""
+    await message.answer(
+        f"⚔️ **Дуэль завершена!**\n"
+        f"🏆 Победитель: **{winner['name']}** (`ID: {winner['game_id']}`) забирает **+{bet}** монет и **+15 XP**!\n"
+        f"💔 Проигравший: **{loser['name']}** (`ID: {loser['game_id']}`) теряет **-{bet}** монет.{lvl_text}",
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data == "act_slots")
+async def on_slots_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GameStates.waiting_slots_bet)
+    await callback.message.answer(
+        "🎰 Введи **ставку монет** для слотов (минимум 10):",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@dp.message(GameStates.waiting_slots_bet)
+async def on_slots_input(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    user = get_user(uid, message.from_user.first_name)
+    try:
+        bet = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введи целое число — сумму ставки.")
+        return
+
+    if bet < 10:
+        await message.answer("Минимальная ставка — 10 монет.")
+        return
+
+    if int(user.get("coins", 0)) < bet:
+        await message.answer("Недостаточно монет на балансе.")
+        return
+
+    symbols = ["🍒", "🍋", "💎", "7️⃣"]
+    reels = [random.choice(symbols) for _ in range(3)]
+    reel_str = " | ".join(reels)
+
+    user["coins"] = int(user.get("coins", 0)) - bet
+    if reels[0] == reels[1] == reels[2]:
+        mult = 5 if reels[0] == "7️⃣" else 3
+        payout = bet * mult
+        user["coins"] = int(user.get("coins", 0)) + payout
+        add_xp(user, 10)
+        res_text = f"🎉 **ДЖЕКПОТ (x{mult})!** Выигрыш **+{payout}** монет и **+10 XP**!"
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        payout = max(1, int(bet * 1.5))
+        user["coins"] = int(user.get("coins", 0)) + payout
+        res_text = f"✨ **Пара совпала!** Возврат/выигрыш **+{payout}** монет."
+    else:
+        res_text = f"💨 Мимо! Потеряно **{bet}** монет."
+
+    save_data()
+    await state.clear()
+    await message.answer(
+        f"🎰 `[ {reel_str} ]`\n\n{res_text}\n💰 Баланс: **{user['coins']}**",
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data == "menu_quest")
+async def on_menu_quest(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user = get_user(uid, callback.from_user.first_name)
+    done = int(user.get("quests_done", 0))
+    claimed = bool(user.get("quest_claimed", False))
+    progress = min(done, QUEST_TARGET_ACTIONS)
+
+    if claimed:
+        status = "✅ Награда за квест уже получена."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboard
+Button(text="⬅️ Назад", callback_data="menu_extra")]]
+        )
+    elif done >= QUEST_TARGET_ACTIONS:
+        status = "🎁 Квест выполнен! Жми кнопку ниже, чтобы забрать награду."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Забрать награду", callback_data="claim_quest")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_extra")],
+            ]
+        )
+    else:
+        status = f"⏳ Прогресс: **{progress}/{QUEST_TARGET_ACTIONS}** активностей (работа или риск-бросок)."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_extra")]]
+        )
+
+    text = (
+        "📜 **Квест игрока**\n\n"
+        f"Цель: сделать **{QUEST_TARGET_ACTIONS}** вылазок или риск-бросков.\n"
+        f"Награда: **+{QUEST_REWARD_COINS}** монет и **+{QUEST_REWARD_XP} XP**.\n\n"
+        f"{status}"
+    )
+    await safe_edit_or_send(callback, text, kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "claim_quest")
+async def on_claim_quest(callback: CallbackQuery):
+    uid = callback.from_user.id
+    user = get_user(uid, callback.from_user.first_name)
+    if bool(user.get("quest_claimed", False)):
+        await callback.answer("Награда уже получена.", show_alert=True)
+        return
+    if int(user.get("quests_done", 0)) < QUEST_TARGET_ACTIONS:
+        await callback.answer("Квест ещё не выполнен.", show_alert=True)
+        return
+
+    user["quest_claimed"] = True
+    user["coins"] = int(user.get("coins", 0)) + QUEST_REWARD_COINS
+    leveled = add_xp(user, QUEST_REWARD_XP)
+    save_data()
+
+    extra = f"\n🎉 Новый уровень: **{user['level']}**!" if leveled else ""
+    await safe_edit_or_send(
+        callback,
+        f"✅ Награда получена: **+{QUEST_REWARD_COINS}** монет и **+{QUEST_REWARD_XP} XP**!{extra}",
+        extra_keyboard(),
+    )
+    await callback.answer("Награда получена!")
+
+
+@dp.callback_query(F.data == "act_lookup")
+async def on_lookup_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(GameStates.waiting_lookup_gid)
+    await callback.message.answer("🔍 Введи **игровой ID** игрока для просмотра его карточки:", parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(GameStates.waiting_lookup_gid)
+async def on_lookup_input(message: Message, state: FSMContext):
+    try:
+        gid = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введи числовой игровой ID.")
+        return
+
+    target = get_user_by_game_id(gid)
+    if not target:
+        await message.answer("Игрок с таким ID не найден.")
+        return
+
+    max_hp = get_max_hp(target)
+    await state.clear()
+    await message.answer(
+        f"🔍 **Карточка игрока**\n\n"
+        f"👤 Имя: **{target.get('name', 'Игрок')}**\n"
+        f"🆔 Игровой ID: **`{target['game_id']}`**\n"
+        f"🏴 Фракция: **{get_faction_label(target)}**\n"
+        f"🏅 Уровень: **{target.get('level', 1)}**\n"
+        f"💰 Монеты: **{target.get('coins', 0)}**\n"
+        f"❤️ HP: **{target.get('hp', max_hp)}/{max_hp}**\n"
+        f"⚡ Бонус силы: **+{target.get('power_bonus', 0)}**",
+        parse_mode="Markdown",
+    )
+
+
 # --- СИСТЕМА ПРОМОКОДОВ И МЕДИА ---
 
 @dp.callback_query(F.data == "act_promo")
@@ -897,7 +1311,7 @@ async def on_med_reward(callback: CallbackQuery, state: FSMContext):
         return
     user = get_user(uid, callback.from_user.first_name)
     now = time.time()
-    left = int(MEDIA_REWARD_COOLDOWN - (now - float(user.get("last_media_reward", 0.0))))
+    left =  int(MEDIA_REWARD_COOLDOWN - (now - float(user.get("last_media_reward", 0.0))))
     if left > 0:
         await callback.answer(f"⏳ Подожди ещё {left} сек.", show_alert=True)
         return
@@ -1488,7 +1902,8 @@ async def on_adm_add_admin_input(message: Message, state: FSMContext):
     admins.add(gid)
     save_data()
     await state.clear()
-    await message.answer(f"✅ Игроку `{gid}` выданы права администратора.", parse_mode="Markdown")
+    await message.answer(f"✅ Игроку `{gid}` выданы права администратора.",
+        parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "adm_del_admin")
@@ -1525,3 +1940,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
