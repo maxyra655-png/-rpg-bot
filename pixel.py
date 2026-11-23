@@ -21,7 +21,7 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DATA_FILE = os.getenv("DATA_FILE", "crmp_russia_data.json")
-CREATOR_ID = int(os.getenv("CREATOR_ID", "5516435343"))
+CREATOR_ID = int(os.getenv("CREATOR_ID", "0"))
 
 NICK_RE = re.compile(r"^[А-ЯЁA-Z][а-яёa-z]{1,14}_[А-ЯЁA-Z][а-яёa-z]{1,14}$")
 NICK_CHANGE_COST = 20000
@@ -33,6 +33,34 @@ PAY_COMMISSION_RATE = 0.03  # 3% комиссия за перевод
 
 DEP_RADIO_MIN_RANK = 6
 DEP_RADIO_COOLDOWN = 10
+
+MAX_OPEN_TICKETS_PER_USER = 2
+
+SUPPORT_CATEGORIES: dict[str, str] = {
+    "quest": "❓ Вопрос по игре",
+    "bug": "🐛 Баг / Проблема",
+    "report": "⚖️ Жалоба на игрока",
+    "donate": "💸 Донат / Имущество",
+    "fac": "🏛 Фракции / Ранги",
+}
+
+MAIN_MENU_BUTTONS: set[str] = {
+    "👤 Профиль",
+    "💵 Работа",
+    "🍔 Еда и отдых",
+    "🏥 Больница",
+    "🎰 Казино",
+    "🏛 Фракции",
+    "🏢 Бизнесы",
+    "🏠 Недвижимость",
+    "🚗 Автосалон",
+    "👨‍👩‍👧‍👦 Семья",
+    "🏆 Топ-10",
+    "🎫 Поддержка",
+    "📖 Команды",
+    "🎬 Медиа",
+    "🛟 Хелперка",
+}
 
 ADMIN_RANKS: dict[int, dict[str, Any]] = {
     1: {"title": "Младший администратор", "perm_desc": "Базовый надзор и просмотр игроков"},
@@ -410,7 +438,9 @@ maintenance_reason: str = "Проводятся технические рабо�
 
 
 class SupportStates(StatesGroup):
+    choosing_category = State()
     waiting_message = State()
+    replying_ticket = State()
 
 
 def clamp_stat(val: int, lo: int = 0, hi: int = 100) -> int:
@@ -841,6 +871,530 @@ async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> Message | No
 dp = Dispatcher()
 dp.message.middleware(BanMiddleware())
 dp.callback_query.middleware(BanMiddleware())
+
+
+def get_user_open_tickets(uid: int) -> list[dict[str, Any]]:
+    res = []
+    for t in support_tickets.values():
+        if isinstance(t, dict) and int(t.get("user_id", 0)) == uid and t.get("status") != "closed":
+            res.append(t)
+    res.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+    return res
+
+
+def render_support_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="✍️ Новое обращение", callback_data="sup_new")]
+    ]
+    for t in get_user_open_tickets(uid)[:3]:
+        tid = str(t["id"])
+        rows.append([
+            InlineKeyboardButton(text=f"📂 Тикет #{tid}", callback_data=f"sup_view:{tid}"),
+            InlineKeyboardButton(text=f"💬 Дописать #{tid}", callback_data=f"sup_ureply:{tid}"),
+            InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_categories_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"sup_cat:{key}")]
+        for key, label in SUPPORT_CATEGORIES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="sup_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def notify_staff_ticket(bot: Bot, ticket_id: str, text_msg: str) -> None:
+    targets: set[int] = set()
+    if CREATOR_ID:
+        targets.add(CREATOR_ID)
+    for k, u in users.items():
+        if isinstance(u, dict):
+            try:
+                tg_id = int(u.get("tg_id") or k)
+            except ValueError:
+                continue
+            if int(u.get("admin_lvl", 0)) >= 1 or int(u.get("helper_lvl", 0)) >= 1:
+                targets.add(tg_id)
+
+    for staff_id in targets:
+        await safe_send(bot, staff_id, text_msg, parse_mode="Markdown")
+
+
+@dp.message(Command("support"))
+@dp.message(F.text == "🎫 Поддержка")
+async def cmd_support(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    await state.clear()
+
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split(maxsplit=1)
+    if raw_text.startswith("/support") and len(parts) == 2 and parts[1].strip():
+        await create_support_ticket(message, bot, p, parts[1].strip()[:1000], category_key="quest")
+        return
+
+    my_open = get_user_open_tickets(uid)
+    status_line = (
+        f"Открытых обращений: **`{len(my_open)}/{MAX_OPEN_TICKETS_PER_USER}`**"
+        if my_open
+        else "У вас пока нет открытых обращений."
+    )
+    await safe_answer(
+        message,
+        f"🎫 **Служба поддержки Criminal Russia RP**\n"
+        f"{status_line}\n\n"
+        f"• Нажмите **«✍️ Новое обращение»**, чтобы выбрать тему и описать ситуацию.\n"
+        f"• Быстрая команда: `/support <ваш вопрос>`",
+        reply_markup=render_support_menu_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data == "sup_menu")
+async def cb_sup_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    uid = callback.from_user.id
+    my_open = get_user_open_tickets(uid)
+    text = (
+        f"🎫 **Служба поддержки Criminal Russia RP**\n"
+        f"Открытых обращений: **`{len(my_open)}/{MAX_OPEN_TICKETS_PER_USER}`**"
+    )
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, reply_markup=render_support_menu_kb(uid), parse_mode="Markdown")
+        except Exception:
+            await safe_answer(callback.message, text, reply_markup=render_support_menu_kb(uid), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sup_new")
+async def cb_sup_new(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    my_open = get_user_open_tickets(uid)
+    if len(my_open) >= MAX_OPEN_TICKETS_PER_USER:
+        await callback.answer(
+            f"Максимум {MAX_OPEN_TICKETS_PER_USER} открытых тикета одновременно. Закройте старый или дождитесь ответа.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(SupportStates.choosing_category)
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                "📌 **Выберите категорию обращения:**",
+                reply_markup=render_categories_kb(),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            await safe_answer(callback.message, "📌 **Выберите категорию обращения:**", reply_markup=render_categories_kb(), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(SupportStates.choosing_category, F.data.startswith("sup_cat:"))
+async def cb_sup_cat(callback: CallbackQuery, state: FSMContext):
+    cat_key = callback.data.split(":", 1)[1]
+    if cat_key not in SUPPORT_CATEGORIES:
+        await callback.answer("Неизвестная категория", show_alert=True)
+        return
+    await state.update_data(support_category=cat_key)
+    await state.set_state(SupportStates.waiting_message)
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                f"✍️ **Категория: {SUPPORT_CATEGORIES[cat_key]}**\n\n"
+                f"Напишите ваш вопрос или описание проблемы **одним сообщением**.\n"
+                f"Для отмены отправьте `/cancel`.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            await safe_answer(
+                callback.message,
+                f"✍️ **Категория: {SUPPORT_CATEGORIES[cat_key]}**\n\nНапишите ваш вопрос или описание проблемы.",
+                parse_mode="Markdown",
+            )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sup_ureply:"))
+async def cb_sup_ureply(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    tid = callback.data.split(":", 1)[1]
+    ticket = support_tickets.get(tid)
+    if not ticket or int(ticket.get("user_id", 0)) != uid or ticket.get("status") == "closed":
+        await callback.answer("Тикет закрыт или не найден", show_alert=True)
+        return
+    await state.update_data(reply_ticket_id=tid)
+    await state.set_state(SupportStates.replying_ticket)
+    await callback.answer()
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            f"💬 Напишите дополнительное сообщение по тикету **`#{tid}`** (или `/cancel` для отмены):",
+            parse_mode="Markdown",
+        )
+
+
+@dp.message(SupportStates.waiting_message)
+async def process_support_text(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    text_body = (message.text or "").strip()
+
+    if not text_body or text_body in MAIN_MENU_BUTTONS or text_body.startswith("/"):
+        await state.clear()
+        await safe_answer(
+            message,
+            "⚠️ Ввод обращения отменён (выбрана команда или кнопка меню).",
+            reply_markup=main_kb(uid),
+        )
+        return
+
+    if len(text_body) < 4:
+        await safe_answer(message, "⚠️ Опишите вопрос подробнее (минимум 4 символа) или отправьте `/cancel`.")
+        return
+
+    data = await state.get_data()
+    cat_key = str(data.get("support_category") or "quest")
+    await state.clear()
+    await create_support_ticket(message, bot, p, text_body[:1000], category_key=cat_key)
+
+
+@dp.message(SupportStates.replying_ticket)
+async def process_user_ticket_reply(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    text_body = (message.text or "").strip()
+
+    if not text_body or text_body in MAIN_MENU_BUTTONS or text_body.startswith("/"):
+        await state.clear()
+        await safe_answer(
+            message,
+            "⚠️ Ответ в тикет отменён (выбрана команда или кнопка меню).",
+            reply_markup=main_kb(uid),
+        )
+        return
+
+    data = await state.get_data()
+    tid = str(data.get("reply_ticket_id") or "")
+    await state.clear()
+
+    ticket = support_tickets.get(tid)
+    if not ticket or int(ticket.get("user_id", 0)) != uid or ticket.get("status") == "closed":
+        await safe_answer(message, "❌ Тикет уже закрыт или не найден.", reply_markup=main_kb(uid))
+        return
+
+    ticket["status"] = "open"
+    ticket.setdefault("messages", []).append({
+        "from": "player",
+        "name": str(p["name"]),
+        "text": text_body[:1000],
+    })
+    save_state()
+
+    await safe_answer(
+        message,
+        f"✅ Сообщение добавлено в тикет **`#{tid}`**! Ожидайте ответа поддержки.",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown",
+    )
+    await notify_staff_ticket(
+        bot,
+        tid,
+        f"💬 **Новое сообщение в тикете `#{tid}`** от **{p['name']}** (`#{p['game_id']}`):\n"
+        f"{text_body[:1000]}\n\n"
+        f"Ответить: `/answer {tid} <текст>` | Закрыть: `/closeticket {tid}`",
+    )
+
+
+@dp.callback_query(F.data.startswith("sup_view:"))
+async def cb_sup_view(callback: CallbackQuery):
+    uid = callback.from_user.id
+    tid = callback.data.split(":", 1)[1]
+    ticket = support_tickets.get(tid)
+    if not ticket or int(ticket.get("user_id", 0)) != uid:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+
+    msgs = ticket.get("messages") or []
+    history_lines = []
+    for m in msgs[-6:]:
+        who = "Вы" if m.get("from") == "player" else f"Поддержка ({m.get('name', 'Хелпер')})"
+        history_lines.append(f"• **{who}:** {m.get('text', '')}")
+
+    status_map = {"open": "🟢 Открыт", "answered": "🔵 Есть ответ", "closed": "🔒 Закрыт"}
+    st_label = status_map.get(str(ticket.get("status", "open")), "Открыт")
+    body = (
+        f"📂 **Тикет `#{tid}`** — {st_label}\n"
+        f"Категория: **{ticket.get('category_label', '❓ Вопрос по игре')}**\n\n"
+        + ("\n".join(history_lines) if history_lines else "_Сообщений пока нет_")
+    )
+    await callback.answer()
+    if callback.message:
+        await safe_answer(callback.message, body, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("sup_uclose:"))
+async def cb_sup_uclose(callback: CallbackQuery, bot: Bot):
+    uid = callback.from_user.id
+    tid = callback.data.split(":", 1)[1]
+    ticket = support_tickets.get(tid)
+    if not ticket or int(ticket.get("user_id", 0)) != uid:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    ticket["status"] = "closed"
+    u = users.get(str(uid))
+    if isinstance(u, dict) and u.get("active_ticket") == tid:
+        u["active_ticket"] = None
+    save_state()
+    await callback.answer(f"Тикет #{tid} закрыт", show_alert=True)
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                f"🔒 Тикет **`#{tid}`** закрыт вами.",
+                reply_markup=render_support_menu_kb(uid),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            await safe_answer(callback.message, f"🔒 Тикет **`#{tid}`** закрыт вами.", parse_mode="Markdown")
+    await notify_staff_ticket(bot, tid, f"ℹ️ Игрок сам закрыл тикет `#{tid}`.")
+
+
+async def create_support_ticket(
+    message: Message,
+    bot: Bot,
+    p: dict[str, Any],
+    body: str,
+    category_key: str = "quest",
+) -> None:
+    global next_ticket_id
+    uid = int(p["tg_id"])
+    if len(get_user_open_tickets(uid)) >= MAX_OPEN_TICKETS_PER_USER:
+        await safe_answer(
+            message,
+            f"⚠️ У вас уже открыто максимальное число тикетов (`{MAX_OPEN_TICKETS_PER_USER}`). Дождитесь ответа или закройте текущий.",
+            reply_markup=main_kb(uid),
+            parse_mode="Markdown",
+        )
+        return
+
+    tid = str(next_ticket_id)
+    next_ticket_id += 1
+    cat_label = SUPPORT_CATEGORIES.get(category_key, "❓ Вопрос по игре")
+
+    support_tickets[tid] = {
+        "id": tid,
+        "user_id": uid,
+        "game_id": int(p["game_id"]),
+        "user_name": str(p["name"]),
+        "category": category_key,
+        "category_label": cat_label,
+        "status": "open",
+        "created_at": int(time.time()),
+        "messages": [{"from": "player", "name": str(p["name"]), "text": body}],
+    }
+    p["active_ticket"] = tid
+    save_state()
+
+    await safe_answer(
+        message,
+        f"✅ Обращение **`#{tid}`** отправлено в поддержку!\n"
+        f"Категория: **{cat_label}**\n"
+        f"Ожидайте ответа хелперов или администрации.",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown",
+    )
+    await notify_staff_ticket(
+        bot,
+        tid,
+        f"🎫 **Новый тикет `#{tid}`** | {cat_label}\n"
+        f"Игрок: **{p['name']}** (`#{p['game_id']}`, TG: `{uid}`, ур. `{p['lvl']}`)\n"
+        f"Текст: {body}\n\n"
+        f"Ответить: `/answer {tid} <текст>` | Закрыть: `/closeticket {tid}`",
+    )
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur is None:
+        await safe_answer(message, "Нет активного действия для отмены.", reply_markup=main_kb(message.from_user.id))
+        return
+    await state.clear()
+    await safe_answer(message, "Действие отменено.", reply_markup=main_kb(message.from_user.id))
+
+
+@dp.message(Command("tickets"))
+@dp.message(F.text == "🛟 Хелперка")
+async def cmd_tickets(message: Message):
+    uid = message.from_user.id
+    if not is_helper(uid, 1):
+        await safe_answer(message, "⛔ Раздел доступен только хелперам и администрации.")
+        return
+
+    active_list = [
+        t for t in support_tickets.values()
+        if isinstance(t, dict) and t.get("status") in {"open", "answered"}
+    ]
+    active_list.sort(key=lambda x: (0 if x.get("status") == "open" else 1, int(x.get("id", 0))))
+    if not active_list:
+        await safe_answer(message, "🛟 Открытых обращений в поддержку сейчас нет.", reply_markup=main_kb(uid))
+        return
+
+    lines = [f"🛟 **Активные тикеты** (`{len(active_list)}`):\n"]
+    kb_rows = []
+    for t in active_list[:15]:
+        msgs = t.get("messages") or []
+        last_txt = msgs[-1].get("text", "") if msgs else ""
+        st_badge = "🟢 Ждёт ответа" if t.get("status") == "open" else "🔵 Отвечен"
+        cat_txt = t.get("category_label") or "❓ Вопрос"
+        lines.append(
+            f"• Тикет **`#{t['id']}`** [{st_badge}] — **{t.get('user_name')}** (`#{t.get('game_id')}`) | {cat_txt}\n"
+            f"  _{last_txt[:100]}_"
+        )
+        kb_rows.append([
+            InlineKeyboardButton(text=f"🔒 Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}"),
+        ])
+    st = get_player(uid, message.from_user.full_name)
+    lines.append(f"\nВаш ранг: **{get_helper_title(int(st.get('helper_lvl', 0)))}** | Ответов: `{st.get('helper_answers', 0)}`")
+    lines.append("Команды: `/answer <ID> <текст>` | `/closeticket <ID>` | `/helpers`")
+    await safe_answer(
+        message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else main_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data.startswith("tclose:"))
+async def cb_close_ticket(callback: CallbackQuery, bot: Bot):
+    uid = callback.from_user.id
+    if not is_helper(uid, 1):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    tid = callback.data.split(":", 1)[1]
+    ticket = support_tickets.get(tid)
+    if not ticket:
+        await callback.answer("Тикет не найден", show_alert=True)
+        return
+    ticket["status"] = "closed"
+    target_uid = int(ticket["user_id"])
+    u = users.get(str(target_uid))
+    if isinstance(u, dict) and u.get("active_ticket") == tid:
+        u["active_ticket"] = None
+    save_state()
+    await callback.answer(f"Тикет #{tid} закрыт", show_alert=True)
+    await safe_send(
+        bot,
+        target_uid,
+        f"🔒 Ваш тикет в поддержку `#{tid}` закрыт. Если появятся новые вопросы — нажмите «🎫 Поддержка» или напишите `/support`.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("answer"))
+async def cmd_answer_ticket(message: Message, bot: Bot):
+    uid = message.from_user.id
+    if not is_helper(uid, 1):
+        await safe_answer(message, "⛔ Отвечать на тикеты могут хелперы и администраторы.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await safe_answer(message, "Формат: `/answer <ID_тикета> <текст ответа>`", parse_mode="Markdown")
+        return
+
+    tid = parts[1].lstrip("#").strip()
+    reply_text = parts[2].strip()
+    ticket = support_tickets.get(tid)
+    if not ticket:
+        await safe_answer(message, f"Тикет `#{tid}` не найден.", parse_mode="Markdown")
+        return
+
+    staff = get_player(uid, message.from_user.full_name)
+    h_lvl = int(staff.get("helper_lvl", 0))
+    h_info = HELPER_RANKS.get(h_lvl, {"title": "Администрация", "ans_bonus": 300, "xp_bonus": 15})
+    bonus_money = int(h_info["ans_bonus"])
+    bonus_xp = int(h_info["xp_bonus"])
+
+    staff["helper_answers"] = int(staff.get("helper_answers", 0)) + 1
+    staff["money"] = int(staff.get("money", 0)) + bonus_money
+    staff["xp"] = int(staff.get("xp", 0)) + bonus_xp
+    while staff["xp"] >= staff["lvl"] * 100:
+        staff["xp"] -= staff["lvl"] * 100
+        staff["lvl"] += 1
+
+    promo_note = ""
+    if 1 <= h_lvl < 6:
+        thresholds = {1: 5, 2: 15, 3: 30, 4: 55, 5: 90}
+        if staff["helper_answers"] >= thresholds.get(h_lvl, 9999):
+            staff["helper_lvl"] = h_lvl + 1
+            promo_note = f"\n🎉 Поздравляем! Вы повышены до ранга **{get_helper_title(h_lvl + 1)}**!"
+
+    ticket["status"] = "answered"
+    ticket.setdefault("messages", []).append({
+        "from": "staff",
+        "name": f"{staff['name']} [{h_info['title']}]",
+        "text": reply_text,
+    })
+    save_state()
+
+    target_uid = int(ticket["user_id"])
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"💬 Ответить в #{tid}", callback_data=f"sup_ureply:{tid}"),
+            InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
+        ]
+    ])
+    await safe_send(
+        bot,
+        target_uid,
+        f"💬 **Ответ поддержки по тикету `#{tid}`** ({staff['name']}):\n{reply_text}",
+        reply_markup=reply_kb,
+        parse_mode="Markdown",
+    )
+
+    await safe_answer(
+        message,
+        f"✅ Ответ по тикету `#{tid}` отправлен! Награда хелпера: **+{bonus_money} ₽**, **+{bonus_xp} XP**.{promo_note}",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("closeticket"))
+async def cmd_close_ticket(message: Message, bot: Bot):
+    uid = message.from_user.id
+    if not is_helper(uid, 1):
+        await safe_answer(message, "⛔ Закрывать тикеты могут хелперы и администраторы.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await safe_answer(message, "Формат: `/closeticket <ID_тикета>`", parse_mode="Markdown")
+        return
+
+    tid = parts[1].lstrip("#").strip()
+    ticket = support_tickets.get(tid)
+    if not ticket:
+        await safe_answer(message, f"Тикет `#{tid}` не найден.", parse_mode="Markdown")
+        return
+
+    ticket["status"] = "closed"
+    target_uid = int(ticket["user_id"])
+    u = users.get(str(target_uid))
+    if isinstance(u, dict) and u.get("active_ticket") == tid:
+        u["active_ticket"] = None
+    save_state()
+
+    await safe_send(
+        bot,
+        target_uid,
+        f"🔒 Ваш тикет в поддержку `#{tid}` закрыт. Если появятся новые вопросы — напишите `/support`.",
+        parse_mode="Markdown",
+    )
+
+    await safe_answer(message, f"🔒 Тикет `#{tid}` закрыт.", parse_mode="Markdown")
 
 
 @dp.message(Command("info"))
@@ -2028,269 +2582,6 @@ async def cb_biz_sell(callback: CallbackQuery):
     await callback.answer(f"Бизнес продан за {refund} ₽!", show_alert=True)
     if callback.message:
         await render_biz_menu(callback.message, uid, edit=True)
-
-
-async def notify_staff_ticket(bot: Bot, ticket_id: str, text_msg: str) -> None:
-    targets: set[int] = set()
-    if CREATOR_ID:
-        targets.add(CREATOR_ID)
-    for k, u in users.items():
-        if isinstance(u, dict):
-            try:
-                tg_id = int(u.get("tg_id") or k)
-            except ValueError:
-                continue
-            if int(u.get("admin_lvl", 0)) >= 1 or int(u.get("helper_lvl", 0)) >= 1:
-                targets.add(tg_id)
-
-    for staff_id in targets:
-        try:
-            await safe_send(bot, staff_id, text_msg, parse_mode="Markdown")
-        except Exception:
-            pass
-
-
-@dp.message(Command("support"))
-@dp.message(F.text == "🎫 Поддержка")
-async def cmd_support(message: Message, state: FSMContext, bot: Bot):
-    uid = message.from_user.id
-    p = get_player(uid, message.from_user.full_name)
-    parts = (message.text or "").split(maxsplit=1)
-
-    if len(parts) == 2 and parts[1].strip():
-        await create_support_ticket(message, bot, p, parts[1].strip())
-        return
-
-    await state.set_state(SupportStates.waiting_message)
-    await safe_answer(
-        message,
-        "🎫 **Служба поддержки**\n"
-        "Напишите ваш вопрос или описание проблемы одним сообщением — хелперы или администраторы ответят вам.\n"
-        "Для отмены отправьте `/cancel`.",
-        parse_mode="Markdown",
-    )
-
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    cur = await state.get_state()
-    if cur is None:
-        await safe_answer(message, "Нет активного действия для отмены.", reply_markup=main_kb(message.from_user.id))
-        return
-    await state.clear()
-    await safe_answer(message, "Действие отменено.", reply_markup=main_kb(message.from_user.id))
-
-
-@dp.message(SupportStates.waiting_message)
-async def process_support_text(message: Message, state: FSMContext, bot: Bot):
-    uid = message.from_user.id
-    p = get_player(uid, message.from_user.full_name)
-    text_body = (message.text or "").strip()
-    if not text_body:
-        await safe_answer(message, "Пожалуйста, напишите текстовое сообщение или отправьте `/cancel`.")
-        return
-    await state.clear()
-    await create_support_ticket(message, bot, p, text_body)
-
-
-async def create_support_ticket(message: Message, bot: Bot, p: dict[str, Any], body: str) -> None:
-    global next_ticket_id
-    tid = str(next_ticket_id)
-    next_ticket_id += 1
-
-    uid = int(p["tg_id"])
-    support_tickets[tid] = {
-        "id": tid,
-        "user_id": uid,
-        "game_id": int(p["game_id"]),
-        "user_name": str(p["name"]),
-        "status": "open",
-        "created_at": int(time.time()),
-        "messages": [{"from": "player", "name": str(p["name"]), "text": body}],
-    }
-    p["active_ticket"] = tid
-    save_state()
-
-    await safe_answer(
-        message,
-        f"✅ Обращение **`#{tid}`** отправлено в поддержку! Ожидайте ответа.",
-        reply_markup=main_kb(uid),
-        parse_mode="Markdown",
-    )
-    await notify_staff_ticket(
-        bot,
-        tid,
-        f"🎫 **Новый тикет `#{tid}`**\n"
-        f"Игрок: **{p['name']}** (`#{p['game_id']}`, TG: `{uid}`)\n"
-        f"Текст: {body}\n"
-        f"Ответить: `/answer {tid} <текст>` | Закрыть: `/closeticket {tid}`",
-    )
-
-
-@dp.message(Command("tickets"))
-@dp.message(F.text == "🛟 Хелперка")
-async def cmd_tickets(message: Message):
-    uid = message.from_user.id
-    if not is_helper(uid, 1):
-        await safe_answer(message, "⛔ Раздел доступен только хелперам и администрации.")
-        return
-
-    open_list = [t for t in support_tickets.values() if isinstance(t, dict) and t.get("status") == "open"]
-    if not open_list:
-        await safe_answer(message, "🛟 Открытых обращений в поддержку сейчас нет.", reply_markup=main_kb(uid))
-        return
-
-    lines = [f"🛟 **Открытые тикеты** (`{len(open_list)}`):\n"]
-    kb_rows = []
-    for t in open_list[:15]:
-        msgs = t.get("messages") or []
-        last_txt = msgs[-1].get("text", "") if msgs else ""
-        lines.append(
-            f"• Тикет **`#{t['id']}`** — **{t.get('user_name')}** (`#{t.get('game_id')}`)\n"
-            f"  _{last_txt[:100]}_"
-        )
-        kb_rows.append([
-            InlineKeyboardButton(text=f"🔒 Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}"),
-        ])
-    st = get_player(uid, message.from_user.full_name)
-    lines.append(f"\nВаш ранг: **{get_helper_title(int(st.get('helper_lvl', 0)))}** | Ответов: `{st.get('helper_answers', 0)}`")
-    lines.append("Команды: `/answer <ID> <текст>` | `/closeticket <ID>` | `/helpers`")
-    await safe_answer(
-        message,
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else main_kb(uid),
-        parse_mode="Markdown",
-    )
-
-
-@dp.callback_query(F.data.startswith("tclose:"))
-async def cb_close_ticket(callback: CallbackQuery, bot: Bot):
-    uid = callback.from_user.id
-    if not is_helper(uid, 1):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-    tid = callback.data.split(":", 1)[1]
-    ticket = support_tickets.get(tid)
-    if not ticket:
-        await callback.answer("Тикет не найден", show_alert=True)
-        return
-    ticket["status"] = "closed"
-    target_uid = int(ticket["user_id"])
-    u = users.get(str(target_uid))
-    if isinstance(u, dict) and u.get("active_ticket") == tid:
-        u["active_ticket"] = None
-    save_state()
-    await callback.answer(f"Тикет #{tid} закрыт", show_alert=True)
-    await safe_send(
-        bot,
-        target_uid,
-        f"🔒 Ваш тикет в поддержку `#{tid}` закрыт. Если появятся новые вопросы — напишите `/support`.",
-        parse_mode="Markdown",
-    )
-
-
-@dp.message(Command("answer"))
-async def cmd_answer_ticket(message: Message, bot: Bot):
-    uid = message.from_user.id
-    if not is_helper(uid, 1):
-        await safe_answer(message, "⛔ Отвечать на тикеты могут хелперы и администраторы.")
-        return
-
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await safe_answer(message, "Формат: `/answer <ID_тикета> <текст ответа>`", parse_mode="Markdown")
-        return
-
-    tid = parts[1].lstrip("#").strip()
-    reply_text = parts[2].strip()
-    ticket = support_tickets.get(tid)
-    if not ticket:
-        await safe_answer(message, f"Тикет `#{tid}` не найден.", parse_mode="Markdown")
-        return
-
-    staff = get_player(uid, message.from_user.full_name)
-    h_lvl = int(staff.get("helper_lvl", 0))
-    h_info = HELPER_RANKS.get(h_lvl, {"title": "Администрация", "ans_bonus": 300, "xp_bonus": 15})
-    bonus_money = int(h_info["ans_bonus"])
-    bonus_xp = int(h_info["xp_bonus"])
-
-    staff["helper_answers"] = int(staff.get("helper_answers", 0)) + 1
-    staff["money"] = int(staff.get("money", 0)) + bonus_money
-    staff["xp"] = int(staff.get("xp", 0)) + bonus_xp
-    while staff["xp"] >= staff["lvl"] * 100:
-        staff["xp"] -= staff["lvl"] * 100
-        staff["lvl"] += 1
-
-    promo_note = ""
-    if 1 <= h_lvl < 6:
-        thresholds = {1: 5, 2: 15, 3: 30, 4: 55, 5: 90}
-        if staff["helper_answers"] >= thresholds.get(h_lvl, 9999):
-            staff["helper_lvl"] = h_lvl + 1
-            promo_note = f"\n🎉 Поздравляем! Вы повышены до ранга **{get_helper_title(h_lvl + 1)}**!"
-
-    ticket.setdefault("messages", []).append({
-        "from": "staff",
-        "name": f"{staff['name']} [{h_info['title']}]",
-        "text": reply_text,
-    })
-    save_state()
-
-    target_uid = int(ticket["user_id"])
-    try:
-        await safe_send(
-            bot,
-            target_uid,
-            f"💬 **Ответ поддержки по тикету `#{tid}`** ({staff['name']}):\n{reply_text}",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-
-    await safe_answer(
-        message,
-        f"✅ Ответ по тикету `#{tid}` отправлен! Награда хелпера: **+{bonus_money} ₽**, **+{bonus_xp} XP**.{promo_note}",
-        parse_mode="Markdown",
-    )
-
-
-@dp.message(Command("closeticket"))
-async def cmd_close_ticket(message: Message, bot: Bot):
-    uid = message.from_user.id
-    if not is_helper(uid, 1):
-        await safe_answer(message, "⛔ Закрывать тикеты могут хелперы и администраторы.")
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_answer(message, "Формат: `/closeticket <ID_тикета>`", parse_mode="Markdown")
-        return
-
-    tid = parts[1].lstrip("#").strip()
-    ticket = support_tickets.get(tid)
-    if not ticket:
-        await safe_answer(message, f"Тикет `#{tid}` не найден.", parse_mode="Markdown")
-        return
-
-    ticket["status"] = "closed"
-    save_state()
-
-    target_uid = int(ticket["user_id"])
-    u = users.get(str(target_uid))
-    if isinstance(u, dict) and u.get("active_ticket") == tid:
-        u["active_ticket"] = None
-        save_state()
-
-    try:
-        await safe_send(
-            bot,
-            target_uid,
-            f"🔒 Ваш тикет в поддержку `#{tid}` закрыт. Если появятся новые вопросы — напишите `/support`.",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-
-    await safe_answer(message, f"🔒 Тикет `#{tid}` закрыт.", parse_mode="Markdown")
 
 
 @dp.message(Command("mediaprize"))
@@ -3488,7 +3779,7 @@ async def cmd_fapps(message: Message):
     if not pending:
         await safe_answer(message, "📋 Новых заявок во фракцию нет.")
         return
-    lines = [f"📋 **Заявки в «{FACTIONS[fid]['name']}»:**\n"]
+    lines = [f"📋 **Заявки в «{FACTIONS[fid]['name']}»** (`{len(pending)}`):\n"]
     for a in pending:
         lines.append(f"• **{a['name']}** (`#{a['game_id']}`) — `/faccept {a['game_id']}` или `/fdecline {a['game_id']}`")
     await safe_answer(message, "\n".join(lines), parse_mode="Markdown")
