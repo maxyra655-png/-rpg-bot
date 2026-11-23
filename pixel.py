@@ -21,7 +21,7 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DATA_FILE = os.getenv("DATA_FILE", "crmp_russia_data.json")
-CREATOR_ID = int(os.getenv("CREATOR_ID", "0"))
+CREATOR_ID = int(os.getenv("CREATOR_ID", "5516435343"))
 
 NICK_RE = re.compile(r"^[А-ЯЁA-Z][а-яёa-z]{1,14}_[А-ЯЁA-Z][а-яёa-z]{1,14}$")
 NICK_CHANGE_COST = 20000
