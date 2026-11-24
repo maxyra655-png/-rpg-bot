@@ -193,11 +193,13 @@ MEDIA_RANKS: dict[int, dict[str, Any]] = {
 
 MEDIA_MAX_RANK = max(MEDIA_RANKS.keys())
 
+# --- РАСШИРЕННЫЕ RP-ЗАДАНИЯ И СЦЕНАРИИ ПО ФРАКЦИЯМ ---
 FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
     "court": [
         {
             "id": "court_case_review",
             "title": "Изучить материалы дела и доказательства",
+            "rp_prompt": "Вы открыли том дела №408. В протоколе обнаружено расхождение во времени допроса и показаниях свидетеля.",
             "duration_sec": 180,
             "reward_money": 2600,
             "reward_xp": 45,
@@ -209,6 +211,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "court_protocols",
             "title": "Проверить протоколы задержаний и ордера",
+            "rp_prompt": "Оперативники принесли запрос на обыск по громкому делу. Нужно сверить основания и подписи прокурора.",
             "duration_sec": 300,
             "reward_money": 4400,
             "reward_xp": 70,
@@ -220,6 +223,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "court_summons",
             "title": "Оформить повестки и судебные запросы",
+            "rp_prompt": "Назначено заседание по экономическому спору. Требуется разослать повестки сторонам и запросить выписки из реестра.",
             "duration_sec": 420,
             "reward_money": 6200,
             "reward_xp": 95,
@@ -231,6 +235,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "court_hearing",
             "title": "Провести открытое судебное слушание",
+            "rp_prompt": "В зале заседаний пресса и стороны процесса. Адвокат заявляет ходатайство об отводе свидетеля.",
             "duration_sec": 600,
             "reward_money": 9200,
             "reward_xp": 135,
@@ -244,6 +249,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "mvd_patrol",
             "title": "Патрулирование улиц и дворов",
+            "rp_prompt": "Экипаж заступил на маршрут. Во дворе замечена подозрительная компания у припаркованного авто без номеров.",
             "duration_sec": 240,
             "reward_money": 3400,
             "reward_xp": 55,
@@ -255,6 +261,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "mvd_statements",
             "title": "Приём и регистрация заявлений граждан",
+            "rp_prompt": "В дежурную часть обратился гражданин с заявлением о пропаже документов и подозрительном переводе.",
             "duration_sec": 180,
             "reward_money": 2500,
             "reward_xp": 40,
@@ -266,6 +273,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "mvd_wanted_check",
             "title": "Отработка ориентировок по розыску",
+            "rp_prompt": "По ориентировке проходит подозреваемый, замеченный у вокзала. Необходимо проверить камеры и перекрыть выходы.",
             "duration_sec": 480,
             "reward_money": 6800,
             "reward_xp": 100,
@@ -274,11 +282,24 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
             "stamina": 25,
             "hunger": 16,
         },
+        {
+            "id": "mvd_raid_check",
+            "title": "Рейд по точкам сбыта и документам",
+            "rp_prompt": "Совместная проверка торговых точек и документов посетителей на предмет нахождения в розыске.",
+            "duration_sec": 540,
+            "reward_money": 7900,
+            "reward_xp": 115,
+            "points": 48,
+            "treasury_cut": 1950,
+            "stamina": 26,
+            "hunger": 18,
+        },
     ],
     "dps": [
         {
             "id": "dps_post",
             "title": "Дежурство на контрольном посту",
+            "rp_prompt": "На посту ДПС останавливается тонированный седан. Водитель нервничает и не сразу передаёт документы.",
             "duration_sec": 240,
             "reward_money": 3200,
             "reward_xp": 50,
@@ -290,6 +311,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "dps_speed",
             "title": "Контроль скоростного режима на трассе",
+            "rp_prompt": "Радар зафиксировал превышение скорости на 75 км/ч на загородном участке.",
             "duration_sec": 360,
             "reward_money": 4900,
             "reward_xp": 75,
@@ -301,6 +323,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "dps_escort",
             "title": "Сопровождение колонны и разбор ДТП",
+            "rp_prompt": "На перекрёстке произошло столкновение двух машин с перекрытием полосы, следом идёт колонна.",
             "duration_sec": 540,
             "reward_money": 7600,
             "reward_xp": 115,
@@ -314,6 +337,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "pps_square",
             "title": "Патрулирование вокзалов и площадей",
+            "rp_prompt": "На центральной площади скопление людей и поступила жалоба на уличного дебошира.",
             "duration_sec": 210,
             "reward_money": 2900,
             "reward_xp": 45,
@@ -325,6 +349,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "pps_night",
             "title": "Ночной обход спального района",
+            "rp_prompt": "Поздний обход дворов. В тёмном переулке сработала сигнализация на складе.",
             "duration_sec": 420,
             "reward_money": 5700,
             "reward_xp": 85,
@@ -338,6 +363,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "fsb_surv",
             "title": "Скрытое наблюдение за объектом",
+            "rp_prompt": "Фигурант оперативной разработки вышел на встречу у заброшенного ангара.",
             "duration_sec": 360,
             "reward_money": 5400,
             "reward_xp": 85,
@@ -349,6 +375,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "fsb_dossiers",
             "title": "Проверка закрытых досье и архивов",
+            "rp_prompt": "Поднят закрытый архив по коррупционной схеме в области. Сверяете проводки и связи.",
             "duration_sec": 480,
             "reward_money": 7200,
             "reward_xp": 110,
@@ -360,6 +387,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "fsb_intercept",
             "title": "Оперативный перехват и брифинг",
+            "rp_prompt": "Получена информация о передаче крупной суммы криминальным структурам.",
             "duration_sec": 600,
             "reward_money": 9600,
             "reward_xp": 140,
@@ -373,6 +401,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "fsin_cells",
             "title": "Обход камер и проверка режима",
+            "rp_prompt": "Плановый обход корпусов и проверка камер на предмет нарушений режима.",
             "duration_sec": 240,
             "reward_money": 3500,
             "reward_xp": 55,
@@ -384,6 +413,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "fsin_convoy",
             "title": "Подготовка и сопровождение конвоя",
+            "rp_prompt": "Формируется автозак для этапирования задержанного в суд. Проверяете связь и маршрут.",
             "duration_sec": 480,
             "reward_money": 6700,
             "reward_xp": 100,
@@ -397,6 +427,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "mchs_equip",
             "title": "Проверка пожарной техники и рукавов",
+            "rp_prompt": "Перед заступлением на дежурство проверяете давление в насосах, аппараты и рукава.",
             "duration_sec": 210,
             "reward_money": 3100,
             "reward_xp": 50,
@@ -408,6 +439,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "mchs_fire",
             "title": "Тушение условного возгорания на складе",
+            "rp_prompt": "Поступил вызов о задымлении на промскладе. Внутри могут оставаться люди.",
             "duration_sec": 450,
             "reward_money": 6300,
             "reward_xp": 95,
@@ -421,6 +453,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "med_stock",
             "title": "Инвентаризация медикаментов и аптечек",
+            "rp_prompt": "Проверяете остатки препаратов, сроки годности и укомплектованность сумок.",
             "duration_sec": 180,
             "reward_money": 2700,
             "reward_xp": 45,
@@ -432,6 +465,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "med_shift",
             "title": "Дежурство в приёмном отделении",
+            "rp_prompt": "В приёмный покой доставили пациента с резким скачком давления и болью в груди.",
             "duration_sec": 390,
             "reward_money": 5600,
             "reward_xp": 85,
@@ -443,6 +477,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "med_ambulance",
             "title": "Смена на выездной бригаде скорой",
+            "rp_prompt": "Срочный вызов на трассу после аварии. Бригада выдвигается с сиреной.",
             "duration_sec": 540,
             "reward_money": 7900,
             "reward_xp": 120,
@@ -456,6 +491,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "smi_news",
             "title": "Подготовка сводки новостей области",
+            "rp_prompt": "Собираете главные события дня для вечернего выпуска: дороги, экономика и службы.",
             "duration_sec": 210,
             "reward_money": 3000,
             "reward_xp": 45,
@@ -467,6 +503,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "smi_broadcast",
             "title": "Проведение прямого эфира и интервью",
+            "rp_prompt": "Красный индикатор эфира включён. В студии гость, зрители присылают вопросы.",
             "duration_sec": 420,
             "reward_money": 5900,
             "reward_xp": 90,
@@ -480,6 +517,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "vo_guard",
             "title": "Караул на КПП воинской части",
+            "rp_prompt": "На КПП подъехал транспорт без пропуска. Проверяете документы и докладываете.",
             "duration_sec": 240,
             "reward_money": 3500,
             "reward_xp": 55,
@@ -491,6 +529,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "vo_drill",
             "title": "Строевая и тактическая подготовка",
+            "rp_prompt": "На плацу и полигоне проходит отработка нормативов и построения.",
             "duration_sec": 480,
             "reward_money": 6900,
             "reward_xp": 105,
@@ -504,6 +543,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "gov_docs",
             "title": "Оформление указов и постановлений",
+            "rp_prompt": "Готовите проект распоряжения администрации области и проверяете формулировку.",
             "duration_sec": 240,
             "reward_money": 3800,
             "reward_xp": 60,
@@ -515,6 +555,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "gov_audit",
             "title": "Выездная проверка госучреждений",
+            "rp_prompt": "Комиссия прибыла с проверкой расходования средств и соблюдения регламентов.",
             "duration_sec": 480,
             "reward_money": 7400,
             "reward_xp": 110,
@@ -528,6 +569,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "opg_sun_points",
             "title": "Обход подконтрольных точек",
+            "rp_prompt": "Проверяете точки под крышей «Солнцевских» и собираете отчёт о ситуации на районе.",
             "duration_sec": 240,
             "reward_money": 3600,
             "reward_xp": 60,
@@ -539,6 +581,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "opg_sun_meeting",
             "title": "Сходка и распределение долей",
+            "rp_prompt": "На сходке обсуждаются новые территории и доля в общак. Нужен холодный расчёт.",
             "duration_sec": 480,
             "reward_money": 7100,
             "reward_xp": 105,
@@ -552,6 +595,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "opg_orekh_scout",
             "title": "Разведка маршрутов перед делом",
+            "rp_prompt": "Изучаете график движения, камеры и посты патрулей на намеченном участке.",
             "duration_sec": 270,
             "reward_money": 4000,
             "reward_xp": 65,
@@ -563,6 +607,7 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         {
             "id": "opg_orekh_heist",
             "title": "Крупная акция и уход от погони",
+            "rp_prompt": "Дело идёт по плану, но в районе замечены сирены. Нужно сработать чётко.",
             "duration_sec": 540,
             "reward_money": 8200,
             "reward_xp": 120,
@@ -573,6 +618,60 @@ FACTION_TASKS: dict[str, list[dict[str, Any]]] = {
         },
     ],
 }
+
+FACTION_RP_SCENARIOS: dict[str, list[dict[str, Any]]] = {
+    "law": [
+        {
+            "id": "law_stop",
+            "title": "Остановка подозрительного авто",
+            "desc": "На трассе водитель проигнорировал требование об остановке и свернул на просёлок.",
+            "opt_a": ("🚨 Блокировать выезд и досмотреть салон", 4200, 65, 22),
+            "opt_b": ("📡 Вызвать подкрепление и вести наблюдение", 3500, 55, 26),
+        },
+        {
+            "id": "law_alarm",
+            "title": "Тревожный сигнал с объекта",
+            "desc": "Сработала тревожная кнопка. Внутри здания возможен конфликт или вооружённый нарушитель.",
+            "opt_a": ("🛡 Действовать жёстко и перекрыть периметр", 5200, 80, 28),
+            "opt_b": ("🎙 Потребовать сдаться через громкоговоритель", 4400, 70, 30),
+        },
+    ],
+    "gov": [
+        {
+            "id": "gov_crisis",
+            "title": "Экстренное совещание по ситуации в городе",
+            "desc": "Поступило обращение о сбое на объекте и нехватке ресурсов. Нужно принять решение.",
+            "opt_a": ("📑 Выделить экстренный резерв и назначить контроль", 4500, 70, 24),
+            "opt_b": ("🤝 Созвать профильные службы и согласовать план", 3800, 60, 28),
+        },
+        {
+            "id": "gov_appeal",
+            "title": "Спорная жалоба на приёме граждан",
+            "desc": "Заявитель предъявляет документы о нарушении сроков рассмотрения дела.",
+            "opt_a": ("⚖️ Вынести мотивированное решение на месте", 4100, 65, 22),
+            "opt_b": ("📂 Запросить материалы и провести проверку", 3600, 55, 25),
+        },
+    ],
+    "crime": [
+        {
+            "id": "crime_deal",
+            "title": "Стрелка за спорную точку",
+            "desc": "Конкуренты пытаются забрать выгодный район. На месте уже собрались бойцы.",
+            "opt_a": ("🔥 Поставить жёсткий ультиматум и забрать долю", 5400, 85, 30),
+            "opt_b": ("💼 Договориться о разделе влияния на выгодных условиях", 4300, 70, 25),
+        },
+        {
+            "id": "crime_tail",
+            "title": "Проверка на «хвост» после дела",
+            "desc": "В зеркале заднего вида дважды мелькнула неприметная машина.",
+            "opt_a": ("🚗 Сменить маршрут через промзону и оторваться", 4600, 75, 26),
+            "opt_b": ("🕶 Уйти в тень, скинуть лишнее и переждать", 3900, 65, 28),
+        },
+    ],
+}
+
+RANK_UP_POINTS_PER_RANK = 60
+FACTION_BONUS_COOLDOWN = 600
 
 FACTIONS: dict[str, dict[str, Any]] = {
     "court": {
@@ -5438,7 +5537,22 @@ async def btn_factions(message: Message):
         )
         rows.append([InlineKeyboardButton(text=f"📝 Подать заявку в {fdata['name']}", callback_data=f"fapp:{fid}")])
     if cur_f in FACTIONS:
-        rows.append([InlineKeyboardButton(text="📋 Задания фракции", callback_data=f"ftasks:{cur_f}")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="📋 Задания фракции", callback_data=f"ftasks:{cur_f}"),
+                InlineKeyboardButton(text="🎭 RP-вызов", callback_data=f"frp:{cur_f}"),
+            ]
+        )
+        if int(p.get("rank", 1)) < 10:
+            need_pts = int(p.get("rank", 1)) * RANK_UP_POINTS_PER_RANK
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"🎖 Повыситься ({p.get('faction_points', 0)}/{need_pts} оч.)",
+                        callback_data=f"fpromo_self:{cur_f}",
+                    )
+                ]
+            )
         rows.append([InlineKeyboardButton(text="🚪 Покинуть фракцию", callback_data="fleave")])
     await safe_answer(message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
@@ -5580,6 +5694,369 @@ async def cb_ftask_start(callback: CallbackQuery):
     save_state()
     await callback.answer(f"Задание начато! Длительность: {format_duration(dur)}", show_alert=True)
 
+
+
+def get_faction_group_key(fid: str) -> str:
+    ftype = str((FACTIONS.get(fid) or {}).get("type") or "gov")
+    if ftype == "crime":
+        return "crime"
+    if ftype == "law":
+        return "law"
+    return "gov"
+
+
+def can_manage_faction(actor: dict[str, Any], fid: str) -> bool:
+    uid = int(actor.get("tg_id", 0))
+    if is_admin(uid, 10):
+        return True
+    return actor.get("leader_of") == fid or (
+        actor.get("faction") == fid and int(actor.get("rank", 1)) >= 11
+    )
+
+
+@dp.message(Command("finfo"))
+async def cmd_finfo(message: Message):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split()
+    fid = parts[1].strip().lower() if len(parts) >= 2 else str(p.get("faction") or "none")
+    if fid not in FACTIONS:
+        await safe_answer(message, "Укажите ключ фракции: <code>/finfo &lt;фракция&gt;</code>", parse_mode="HTML")
+        return
+
+    fdata = FACTIONS[fid]
+    fs = get_fstate(fid)
+    members_cnt = sum(
+        1 for u in users.values() if isinstance(u, dict) and u.get("faction") == fid
+    )
+    leader_names = [
+        str(u.get("name"))
+        for u in users.values()
+        if isinstance(u, dict) and u.get("leader_of") == fid
+    ]
+    leader_txt = ", ".join(esc(x) for x in leader_names) if leader_names else "<i>Вакантно</i>"
+
+    await safe_answer(
+        message,
+        f"🏛 <b>Сводка фракции: {esc(fdata['name'])}</b> (<code>{esc(fid)}</code>)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👑 Лидер: {leader_txt}\n"
+        f"👥 Личный состав: <b><code>{members_cnt}</code></b> чел.\n"
+        f"🏦 Казна: <b>{esc(format_rub(int(fs.get('treasury', 0))))}</b>\n"
+        f"📦 Материалы / снабжение: <b><code>{int(fs.get('materials', 0))}</code></b>\n"
+        f"🏅 Рейтинг активности: <b><code>{int(fs.get('rating', 0))}</code></b>\n"
+        f"💵 Базовый оклад: <b>{esc(format_rub(int(fdata['salary'])))}</b> | Мин. уровень: <code>{fdata['min_lvl']}</code>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("finvite"))
+async def cmd_finvite(message: Message, bot: Bot):
+    uid = message.from_user.id
+    actor = get_player(uid, message.from_user.full_name)
+    fid = actor.get("leader_of") or (actor.get("faction") if int(actor.get("rank", 1)) >= 11 else None)
+    if not fid or fid not in FACTIONS:
+        await safe_answer(message, "⛔ Принимать во фракцию могут лидеры и заместители (11–13 ранги).")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("#").isdigit():
+        await safe_answer(message, "Формат: <code>/finvite &lt;игровой_ID&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1].lstrip("#"))
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    if target.get("faction", "none") != "none":
+        await safe_answer(message, "⚠️ Игрок уже состоит в другой фракции.")
+        return
+    if int(target.get("lvl", 1)) < int(FACTIONS[fid]["min_lvl"]):
+        await safe_answer(message, f"⚠️ Для вступления нужен минимум <code>{FACTIONS[fid]['min_lvl']}</code> уровень.", parse_mode="HTML")
+        return
+
+    target["faction"] = fid
+    target["rank"] = 1
+    target["f_warns"] = 0
+    target["faction_points"] = 0
+    save_state()
+    await safe_answer(
+        message,
+        f"✅ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) принят в «{esc(FACTIONS[fid]['name'])}» (1 ранг).",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, int(target["tg_id"]), f"🎉 Вас приняли во фракцию <b>«{esc(FACTIONS[fid]['name'])}»</b>!", parse_mode="HTML")
+
+
+@dp.message(Command("fkick"))
+async def cmd_fkick(message: Message, bot: Bot):
+    uid = message.from_user.id
+    actor = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
+        await safe_answer(message, "Формат: <code>/fkick &lt;игровой_ID&gt; [причина]</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1].lstrip("#"))
+    reason = parts[2].strip() if len(parts) == 3 and parts[2].strip() else "Решение руководства фракции"
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    tfac = target.get("faction", "none")
+    if tfac not in FACTIONS or not can_manage_faction(actor, tfac):
+        await safe_answer(message, "⛔ Недостаточно прав для увольнения этого сотрудника.")
+        return
+    if int(target.get("tg_id", 0)) == uid:
+        await safe_answer(message, "Нельзя уволить самого себя.")
+        return
+
+    target["faction"] = "none"
+    target["rank"] = 1
+    target["f_warns"] = 0
+    target["leader_of"] = None
+    target["active_ftask_id"] = None
+    target["active_ftask_ends_at"] = 0.0
+    save_state()
+    await safe_answer(
+        message,
+        f"📤 Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) уволен из фракции «{esc(FACTIONS[tfac]['name'])}».\nПричина: <i>{esc(reason)}</i>",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, int(target["tg_id"]), f"📤 Вы были уволены из фракции <b>«{esc(FACTIONS[tfac]['name'])}»</b>. Причина: {reason}", parse_mode="HTML")
+
+
+@dp.message(Command("fpromote"))
+async def cmd_fpromote(message: Message, bot: Bot):
+    uid = message.from_user.id
+    actor = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("#").isdigit():
+        await safe_answer(message, "Формат: <code>/fpromote &lt;игровой_ID&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1].lstrip("#"))
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    tfac = target.get("faction", "none")
+    if tfac not in FACTIONS or not can_manage_faction(actor, tfac):
+        await safe_answer(message, "⛔ Повышать сотрудников могут лидеры, заместители (11–13) или администрация 10+.")
+        return
+    cur_rk = int(target.get("rank", 1))
+    max_allowed = 13 if is_admin(uid, 11) or actor.get("leader_of") == tfac else 10
+    if cur_rk >= max_allowed:
+        await safe_answer(message, f"⚠️ Достигнут максимальный доступный ранг (<code>{max_allowed}/13</code>).", parse_mode="HTML")
+        return
+
+    target["rank"] = cur_rk + 1
+    save_state()
+    new_title = get_faction_rank_title(tfac, cur_rk + 1)
+    await safe_answer(
+        message,
+        f"⬆️ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) повышен до звания <b>{esc(new_title)}</b> (<code>{cur_rk + 1}/13</code>)!",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, int(target["tg_id"]), f"⬆️ Вы повышены во фракции до звания <b>{esc(new_title)}</b> (<code>{cur_rk + 1}/13</code>)!", parse_mode="HTML")
+
+
+@dp.message(Command("fdemote"))
+async def cmd_fdemote(message: Message, bot: Bot):
+    uid = message.from_user.id
+    actor = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("#").isdigit():
+        await safe_answer(message, "Формат: <code>/fdemote &lt;игровой_ID&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1].lstrip("#"))
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    tfac = target.get("faction", "none")
+    if tfac not in FACTIONS or not can_manage_faction(actor, tfac):
+        await safe_answer(message, "⛔ Понижать сотрудников могут лидеры, заместители (11–13) или администрация 10+.")
+        return
+    cur_rk = int(target.get("rank", 1))
+    if cur_rk <= 1:
+        await safe_answer(message, "⚠️ У игрока уже минимальный 1 ранг.")
+        return
+
+    target["rank"] = cur_rk - 1
+    save_state()
+    new_title = get_faction_rank_title(tfac, cur_rk - 1)
+    await safe_answer(
+        message,
+        f"⬇️ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) понижен до звания <b>{esc(new_title)}</b> (<code>{cur_rk - 1}/13</code>).",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, int(target["tg_id"]), f"⬇️ Ваш ранг во фракции понижен до <b>{esc(new_title)}</b> (<code>{cur_rk - 1}/13</code>).", parse_mode="HTML")
+
+
+@dp.message(Command("fbonus"))
+async def cmd_fbonus(message: Message, bot: Bot):
+    uid = message.from_user.id
+    actor = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].lstrip("#").isdigit() or not parts[2].isdigit():
+        await safe_answer(message, "Формат: <code>/fbonus &lt;игровой_ID&gt; &lt;сумма&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1].lstrip("#"))
+    amount = int(parts[2])
+    if not (500 <= amount <= 250_000):
+        await safe_answer(message, "Премия должна быть от <code>500 ₽</code> до <code>250 000 ₽</code>.", parse_mode="HTML")
+        return
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    tfac = target.get("faction", "none")
+    if tfac not in FACTIONS or not can_manage_faction(actor, tfac):
+        await safe_answer(message, "⛔ Выдавать премии из казны могут лидеры/заместители фракции или администрация 10+.")
+        return
+
+    fs = get_fstate(tfac)
+    treasury = int(fs.get("treasury", 0))
+    if treasury < amount:
+        await safe_answer(message, f"🏦 В казне фракции недостаточно средств (доступно: <b>{esc(format_rub(treasury))}</b>).", parse_mode="HTML")
+        return
+
+    now = time.time()
+    last_b = float(fs.get("last_bonus", 0.0) or 0.0)
+    if not is_admin(uid, 10) and (now - last_b) < FACTION_BONUS_COOLDOWN:
+        await safe_answer(
+            message,
+            f"⏳ Выдавать премии из казны можно раз в {FACTION_BONUS_COOLDOWN // 60} мин. Осталось: <b>{esc(format_duration(FACTION_BONUS_COOLDOWN - (now - last_b)))}</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    fs["treasury"] = treasury - amount
+    fs["last_bonus"] = now
+    target["money"] = int(target.get("money", 0)) + amount
+    save_state()
+
+    await safe_answer(
+        message,
+        f"🎖 Выдана премия <b>+{esc(format_rub(amount))}</b> из казны «{esc(FACTIONS[tfac]['name'])}» игроку <b>{esc(target['name'])}</b> (<code>#{gid}</code>)!",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, int(target["tg_id"]), f"🎖 Вам выплачена премия <b>+{esc(format_rub(amount))}</b> из казны фракции «{esc(FACTIONS[tfac]['name'])}»!", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("frp:"))
+async def cb_frp_menu(callback: CallbackQuery):
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    fid = callback.data.split(":", 1)[1]
+    if p.get("faction") != fid or fid not in FACTIONS:
+        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
+        return
+    if int(p.get("stamina", 100)) < 15 or int(p.get("hunger", 100)) < 10:
+        await callback.answer("Нужно минимум 15 сил и 10 сытости для RP-операции", show_alert=True)
+        return
+
+    grp = get_faction_group_key(fid)
+    pool = FACTION_RP_SCENARIOS.get(grp) or FACTION_RP_SCENARIOS["gov"]
+    sc = random.choice(pool)
+    opt_a_txt = sc["opt_a"][0]
+    opt_b_txt = sc["opt_b"][0]
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=opt_a_txt[:42], callback_data=f"frp_do:{fid}:{sc['id']}:a")],
+            [InlineKeyboardButton(text=opt_b_txt[:42], callback_data=f"frp_do:{fid}:{sc['id']}:b")],
+        ]
+    )
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            f"🎭 <b>RP-ситуация · {esc(FACTIONS[fid]['name'])}</b>\n"
+            f"<b>{esc(sc['title'])}</b>\n\n"
+            f"<i>{esc(sc['desc'])}</i>\n\n"
+            f"Выберите действие:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("frp_do:"))
+async def cb_frp_do(callback: CallbackQuery):
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    _, fid, sc_id, choice = callback.data.split(":", 3)
+    if p.get("faction") != fid or fid not in FACTIONS:
+        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
+        return
+    if int(p.get("stamina", 100)) < 15 or int(p.get("hunger", 100)) < 10:
+        await callback.answer("Недостаточно сил или сытости", show_alert=True)
+        return
+
+    grp = get_faction_group_key(fid)
+    pool = FACTION_RP_SCENARIOS.get(grp) or FACTION_RP_SCENARIOS["gov"]
+    sc = next((x for x in pool if x["id"] == sc_id), pool[0])
+    _, base_money, base_xp, base_pts = sc["opt_a"] if choice == "a" else sc["opt_b"]
+
+    mult = random.choice([0.9, 1.0, 1.15, 1.3])
+    rew_money = int(base_money * mult)
+    rew_xp = int(base_xp * mult)
+    rew_pts = max(5, int(base_pts * mult))
+    t_cut = int(rew_money * 0.25)
+
+    p["money"] += rew_money
+    p["xp"] += rew_xp
+    p["faction_points"] = int(p.get("faction_points", 0)) + rew_pts
+    p["stamina"] = clamp_stat(int(p.get("stamina", 100)) - 15)
+    p["hunger"] = clamp_stat(int(p.get("hunger", 100)) - 10)
+    while p["xp"] >= p["lvl"] * 100:
+        p["xp"] -= p["lvl"] * 100
+        p["lvl"] += 1
+
+    fs = get_fstate(fid)
+    fs["treasury"] = int(fs.get("treasury", 0)) + t_cut
+    fs["rating"] = int(fs.get("rating", 0)) + rew_pts
+    save_state()
+
+    verdict = "Отличный отыгрыш! Премия повышена." if mult > 1.0 else "RP-сценарий успешно отыгран."
+    await callback.answer(f"+{rew_money} ₽ | +{rew_pts} очков фракции", show_alert=True)
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            f"✅ <b>{verdict}</b>\n"
+            f"Фракция: <b>{esc(FACTIONS[fid]['name'])}</b>\n"
+            f"Награда: <b>+{rew_money} ₽</b> · <b>+{rew_xp} XP</b> · <b>+{rew_pts} очков</b> (в казну: +{t_cut} ₽).",
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data.startswith("fpromo_self:"))
+async def cb_fpromo_self(callback: CallbackQuery):
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    fid = callback.data.split(":", 1)[1]
+    if p.get("faction") != fid or fid not in FACTIONS:
+        await callback.answer("Вы не во фракции", show_alert=True)
+        return
+    cur_rk = int(p.get("rank", 1))
+    if cur_rk >= 10:
+        await callback.answer("С 10 ранга повышение происходит через руководство фракции или администрацию", show_alert=True)
+        return
+    pts = int(p.get("faction_points", 0))
+    need_pts = cur_rk * RANK_UP_POINTS_PER_RANK
+    if pts < need_pts:
+        await callback.answer(f"Нужно {need_pts} очков службы (у вас {pts})", show_alert=True)
+        return
+
+    p["faction_points"] = pts - need_pts
+    p["rank"] = cur_rk + 1
+    save_state()
+    new_title = get_faction_rank_title(fid, cur_rk + 1)
+    await callback.answer(f"Повышение до {new_title} ({cur_rk + 1}/13)!", show_alert=True)
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            f"🎖 Вы повышены по выслуге и очкам службы до звания <b>{esc(new_title)}</b> (<code>{cur_rk + 1}/13</code>)!",
+            parse_mode="HTML",
+        )
 
 @dp.message(Command("fapps"))
 async def cmd_fapps(message: Message):
