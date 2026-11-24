@@ -1,10 +1,12 @@
 import asyncio
 import html
+import io
 import json
 import os
 import random
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
@@ -12,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -20,8 +23,21 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+    ImageFont = None  # type: ignore[assignment]
+    PIL_AVAILABLE = False
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DATA_FILE = os.getenv("DATA_FILE", "crmp_russia_data.json")
+PASSPORT_TEMPLATE_PATH = os.getenv("PASSPORT_TEMPLATE_PATH", "passport_template.png")
+FONT_PATH = os.getenv("FONT_PATH", "")
 CREATOR_ID = int(os.getenv("CREATOR_ID", "5516435343"))
 
 NICK_RE = re.compile(r"^[А-ЯЁA-Z][а-яёa-z]{1,14}_[А-ЯЁA-Z][а-яёa-z]{1,14}$")
@@ -36,6 +52,10 @@ DEP_RADIO_MIN_RANK = 6
 DEP_RADIO_COOLDOWN = 10
 
 MAX_OPEN_TICKETS_PER_USER = 2
+
+FAMILY_CREATE_COST = 50000
+FAMILY_UPGRADE_BASE_COST = 900000
+FAMILY_DAILY_CONTRACTS_LIMIT = 2
 
 SUPPORT_CATEGORIES: dict[str, str] = {
     "quest": "❓ Вопрос по игре",
@@ -899,6 +919,12 @@ SHOP_HOUSES: dict[str, dict[str, Any]] = {
     "villa": {"name": "Элитная вилла на Рублёвке", "price": 7500000, "bonus_bank": 5000},
 }
 
+FAMILY_WEAPONS: dict[str, dict[str, Any]] = {
+    "makarov": {"name": "Пистолет Макарова", "price": 45000, "rep_bonus": 10},
+    "ak74": {"name": "Автомат АК-74", "price": 135000, "rep_bonus": 25},
+    "saiga": {"name": "Карабин Сайга-12", "price": 195000, "rep_bonus": 35},
+}
+
 FOOD_ITEMS: dict[str, dict[str, Any]] = {
     "shawarma": {"name": "🌯 Шаурма у вокзала", "price": 600, "hunger": 25, "stamina": 10, "hp": 5},
     "dinner": {"name": "🍲 Обед в столовой", "price": 1400, "hunger": 55, "stamina": 25, "hp": 10},
@@ -949,10 +975,20 @@ maintenance_mode: bool = False
 maintenance_reason: str = "Проводятся технические работы. Попробуйте позже."
 
 
+class RegistrationStates(StatesGroup):
+    waiting_nickname = State()
+
+
 class SupportStates(StatesGroup):
     choosing_category = State()
     waiting_message = State()
     replying_ticket = State()
+
+
+class FamilyStates(StatesGroup):
+    inviting_member = State()
+    renaming_family = State()
+    depositing_treasury = State()
 
 
 def esc(val: Any) -> str:
@@ -963,12 +999,47 @@ def clamp_stat(val: int, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, int(val)))
 
 
+def format_rub(amount: int) -> str:
+    sign = "-" if amount < 0 else ""
+    digits = f"{abs(int(amount)):,}".replace(",", ".")
+    return f"{sign}{digits} руб."
+
+
+def get_reputation_title(rep: int) -> str:
+    if rep >= 500:
+        return "Легенда области"
+    if rep >= 200:
+        return "Уважаемый житель"
+    if rep >= 50:
+        return "Авторитет"
+    if rep >= 10:
+        return "Свой человек"
+    if rep >= 0:
+        return "Новичок"
+    return "Неблагонадёжный"
+
+
+def get_world_time_and_weather() -> tuple[str, str]:
+    now_dt = datetime.now()
+    time_str = now_dt.strftime("%H:%M")
+    hour = now_dt.hour
+    if 5 <= hour < 11:
+        weather = "СВЕЖО"
+    elif 11 <= hour < 17:
+        weather = "ЯСНО"
+    elif 17 <= hour < 22:
+        weather = "ПРОХЛАДНО"
+    else:
+        weather = "ТУМАННО"
+    return time_str, weather
+
+
 def validate_rp_nick(nick: str) -> tuple[bool, str]:
     clean = nick.strip()
     if len(clean) < 5 or len(clean) > 31:
         return False, "Ник должен быть в формате <code>Имя_Фамилия</code> (от 5 до 31 символа, без пробелов)."
     if not NICK_RE.match(clean):
-        return False, "Неверный формат ника. Используйте <code>Имя_Фамилия</code> (например, <code>Иван_Волков</code> или <code>Ivan_Volkov</code>)."
+        return False, "Неверный формат ника. Используйте <code>Имя_Фамилия</code> (например, <code>Никита_Шакуров</code> или <code>Ivan_Volkov</code>)."
     return True, clean
 
 
@@ -999,7 +1070,14 @@ def normalize_player(u: dict[str, Any], tg_id: int) -> dict[str, Any]:
         u["game_id"] = int(u["game_id"])
         if u["game_id"] >= next_game_id:
             next_game_id = u["game_id"] + 1
-    u["name"] = str(u.get("name") or f"Игрок_{tg_id}")
+
+    raw_name = str(u.get("name") or "").strip()
+    if not raw_name:
+        raw_name = f"Игрок_{tg_id}"
+    u["name"] = raw_name
+    u["registered"] = bool(u.get("registered", False)) or bool(NICK_RE.match(raw_name))
+    u["reg_date"] = str(u.get("reg_date") or datetime.now().strftime("%d %B %Y г."))
+
     raw_age = u.get("age")
     if raw_age is not None:
         try:
@@ -1009,9 +1087,11 @@ def normalize_player(u: dict[str, Any], tg_id: int) -> dict[str, Any]:
             u["age"] = None
     else:
         u["age"] = None
+
     u["last_nick_change"] = float(u.get("last_nick_change", 0.0) or 0.0)
     u["lvl"] = max(1, int(u.get("lvl", 1)))
     u["xp"] = max(0, int(u.get("xp", 0)))
+    u["reputation"] = int(u.get("reputation", 25))
     u["money"] = int(u.get("money", 5000))
     u["bank"] = int(u.get("bank", 0))
     u["hp"] = clamp_stat(u.get("hp", 100))
@@ -1058,7 +1138,7 @@ def normalize_player(u: dict[str, Any], tg_id: int) -> dict[str, Any]:
 
     u["banned"] = bool(u.get("banned", False))
     u["ban_reason"] = str(u.get("ban_reason") or "")
-    u["tempban_until"] = float(u.get("tempban_until", 0.0))
+    u["tempban_until"] = float(u.get("tempban_until", 0.0) or 0.0)
     u["tempban_reason"] = str(u.get("tempban_reason") or "")
     u["wanted"] = max(0, min(6, int(u.get("wanted", 0))))
     u["fines"] = max(0, int(u.get("fines", 0)))
@@ -1075,15 +1155,51 @@ def normalize_player(u: dict[str, Any], tg_id: int) -> dict[str, Any]:
     return u
 
 
+def normalize_family(fdata: dict[str, Any], fid: str) -> dict[str, Any]:
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    fdata["id"] = str(fid)
+    fdata["name"] = str(fdata.get("name") or f"Семья_{fid}")
+    fdata["owner_uid"] = int(fdata.get("owner_uid", 0))
+    fdata["owner_name"] = str(fdata.get("owner_name") or "Глава")
+    members = [int(m) for m in (fdata.get("members") or []) if str(m).lstrip("-").isdigit()]
+    if fdata["owner_uid"] and fdata["owner_uid"] not in members:
+        members.insert(0, fdata["owner_uid"])
+    fdata["members"] = members
+    fdata["balance"] = max(0, int(fdata.get("balance", 0)))
+    fdata["tokens"] = max(0, int(fdata.get("tokens", 0)))
+    fdata["reputation"] = int(fdata.get("reputation", 0))
+    fdata["level"] = max(1, int(fdata.get("level", 1)))
+    fdata["max_members"] = max(len(members), int(fdata.get("max_members", 8)))
+    fdata["max_cars"] = max(1, int(fdata.get("max_cars", 3)))
+    fdata["has_mansion"] = bool(fdata.get("has_mansion", False))
+    fdata["mansion_name"] = str(fdata.get("mansion_name") or "Рублёвский особняк")
+    fdata["tanker_fuel"] = max(0, int(fdata.get("tanker_fuel", 0)))
+    fdata["warehouse_items"] = max(0, int(fdata.get("warehouse_items", 0)))
+    fdata["cars"] = [str(c) for c in (fdata.get("cars") or [])]
+    fdata["weapons"] = [str(w) for w in (fdata.get("weapons") or [])]
+    fdata["ranks"] = dict(fdata.get("ranks") or {})
+    if fdata.get("contracts_date") != today_str:
+        fdata["contracts_date"] = today_str
+        fdata["contracts_done"] = 0
+    else:
+        fdata["contracts_done"] = max(0, int(fdata.get("contracts_done", 0)))
+    return fdata
+
+
 def get_player(tg_id: int, full_name: str = "") -> dict[str, Any]:
     key = str(tg_id)
     if key not in users or not isinstance(users[key], dict):
-        users[key] = normalize_player({"name": full_name or f"Игрок_{tg_id}"}, tg_id)
+        users[key] = normalize_player(
+            {
+                "name": full_name or f"Игрок_{tg_id}",
+                "registered": False,
+                "reg_date": datetime.now().strftime("%d %B %Y г."),
+            },
+            tg_id,
+        )
         save_state()
     else:
         normalize_player(users[key], tg_id)
-        if full_name and users[key]["name"].startswith("Игрок_"):
-            users[key]["name"] = full_name
     return users[key]
 
 
@@ -1235,18 +1351,25 @@ def find_faction_task(fid: str, task_id: str | None) -> dict[str, Any] | None:
 
 def get_fstate(fid: str) -> dict[str, Any]:
     if fid not in faction_state:
-        faction_state[fid] = dict(DEFAULT_FACTION_STATE.get(fid, {
-            "treasury": 25000,
-            "materials": 500,
-            "rating": 0,
-            "last_raid": 0.0,
-            "last_bonus": 0.0,
-        }))
+        faction_state[fid] = dict(
+            DEFAULT_FACTION_STATE.get(
+                fid,
+                {
+                    "treasury": 25000,
+                    "materials": 500,
+                    "rating": 0,
+                    "last_raid": 0.0,
+                    "last_bonus": 0.0,
+                },
+            )
+        )
     return faction_state[fid]
 
 
 def is_police_faction(u: dict[str, Any]) -> bool:
-    return str(u.get("faction") or "") in {"mvd", "dps", "pps", "fsb", "fsin", "vo"} or is_admin(int(u.get("tg_id", 0)), 1)
+    return str(u.get("faction") or "") in {"mvd", "dps", "pps", "fsb", "fsin", "vo"} or is_admin(
+        int(u.get("tg_id", 0)), 1
+    )
 
 
 def load_state() -> None:
@@ -1279,7 +1402,9 @@ def load_state() -> None:
     next_game_id = max(100, int(raw.get("next_game_id", 100)))
     next_ticket_id = max(1, int(raw.get("next_ticket_id", 1)))
     maintenance_mode = bool(raw.get("maintenance_mode", False))
-    maintenance_reason = str(raw.get("maintenance_reason") or "Проводятся технические работы. Попробуйте позже.")
+    maintenance_reason = str(
+        raw.get("maintenance_reason") or "Проводятся технические работы. Попробуйте позже."
+    )
 
     raw_users = raw.get("users") if isinstance(raw.get("users"), dict) else {}
     for k, v in raw_users.items():
@@ -1298,22 +1423,27 @@ def load_state() -> None:
     raw_biz = raw.get("businesses") if isinstance(raw.get("businesses"), dict) else {}
     for bid, bval in raw_biz.items():
         if isinstance(bval, dict):
-            base = dict(DEFAULT_BUSINESSES.get(bid, {
-                "name": str(bval.get("name") or bid),
-                "price": int(bval.get("price", 1000000)),
-                "income_per_hour": int(bval.get("income_per_hour", 5000)),
-                "owner_uid": None,
-                "owner_name": None,
-                "cash": 0,
-                "last_collect": 0.0,
-            }))
+            base = dict(
+                DEFAULT_BUSINESSES.get(
+                    bid,
+                    {
+                        "name": str(bval.get("name") or bid),
+                        "price": int(bval.get("price", 1000000)),
+                        "income_per_hour": int(bval.get("income_per_hour", 5000)),
+                        "owner_uid": None,
+                        "owner_name": None,
+                        "cash": 0,
+                        "last_collect": 0.0,
+                    },
+                )
+            )
             base.update(bval)
             businesses[str(bid)] = base
 
     raw_fams = raw.get("families") if isinstance(raw.get("families"), dict) else {}
     for fid, fval in raw_fams.items():
         if isinstance(fval, dict):
-            families[str(fid)] = dict(fval)
+            families[str(fid)] = normalize_family(dict(fval), str(fid))
 
     raw_promos = raw.get("promocodes") if isinstance(raw.get("promocodes"), dict) else {}
     for code, pdata in raw_promos.items():
@@ -1407,6 +1537,182 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts) if parts else "меньше минуты"
 
 
+def _load_font(size: int, bold: bool = False):
+    if not PIL_AVAILABLE or ImageFont is None:
+        return None
+    candidates: list[str] = []
+    if FONT_PATH:
+        candidates.append(FONT_PATH)
+    if bold:
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "C:/Windows/Fonts/arialbd.ttf",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+            ]
+        )
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _build_passport_card_bytes(p: dict[str, Any], avatar_bytes: bytes | None = None) -> bytes | None:
+    if not PIL_AVAILABLE or Image is None or ImageDraw is None:
+        return None
+
+    width, height = 1000, 560
+    if PASSPORT_TEMPLATE_PATH and os.path.exists(PASSPORT_TEMPLATE_PATH):
+        try:
+            canvas = Image.open(PASSPORT_TEMPLATE_PATH).convert("RGBA").resize((width, height))
+        except Exception:
+            canvas = Image.new("RGBA", (width, height), (242, 232, 227, 255))
+    else:
+        canvas = Image.new("RGBA", (width, height), (242, 232, 227, 255))
+        draw_bg = ImageDraw.Draw(canvas)
+        draw_bg.rounded_rectangle([18, 18, width - 18, height - 18], radius=28, fill=(246, 238, 234, 255), outline=(128, 96, 82, 255), width=4)
+        title_font = _load_font(30, bold=True)
+        draw_bg.text((width // 2, 46), "★  ПАСПОРТ ГРАЖДАНИНА  ★", fill=(104, 74, 62, 255), font=title_font, anchor="mm")
+
+        labels_left = [
+            (340, 125, "ФАМИЛИЯ"),
+            (340, 215, "ИМЯ"),
+            (340, 305, "ЗДОРОВЬЕ"),
+            (340, 395, "КОШЕЛЁК"),
+        ]
+        labels_right = [
+            (675, 125, "ВРЕМЯ"),
+            (675, 215, "ПОГОДА"),
+            (675, 305, "СЫТОСТЬ"),
+            (675, 395, "БАНК"),
+        ]
+        lbl_font = _load_font(15, bold=True)
+        for lx, ly, ltxt in labels_left + labels_right:
+            draw_bg.text((lx, ly), ltxt, fill=(138, 108, 96, 255), font=lbl_font, anchor="lm")
+            draw_bg.line([(lx, ly + 44), (lx + 265, ly + 44)], fill=(175, 150, 140, 255), width=2)
+
+        draw_bg.text((70, 468), "УРОВЕНЬ", fill=(138, 108, 96, 255), font=lbl_font, anchor="lm")
+        draw_bg.line([(70, 524), (760, 524)], fill=(175, 150, 140, 255), width=2)
+        draw_bg.ellipse([805, 420, 945, 540], outline=(138, 108, 96, 255), width=3)
+        draw_bg.text((875, 480), "CRMP", fill=(120, 90, 78, 255), font=_load_font(22, bold=True), anchor="mm")
+
+    photo_box = (68, 108, 292, 422)
+    photo_w = photo_box[2] - photo_box[0]
+    photo_h = photo_box[3] - photo_box[1]
+    if avatar_bytes:
+        try:
+            av_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((photo_w, photo_h))
+            canvas.paste(av_img, (photo_box[0], photo_box[1]), av_img)
+        except Exception:
+            avatar_bytes = None
+
+    draw = ImageDraw.Draw(canvas)
+    if not avatar_bytes:
+        draw.rectangle(photo_box, fill=(226, 216, 211, 255), outline=(145, 118, 106, 255), width=2)
+        draw.text(
+            ((photo_box[0] + photo_box[2]) // 2, (photo_box[1] + photo_box[3]) // 2),
+            "ФОТО",
+            fill=(120, 94, 82, 255),
+            font=_load_font(26, bold=True),
+            anchor="mm",
+        )
+
+    parts_nick = str(p.get("name") or "Игрок_РФ").split("_", 1)
+    first_name = parts_nick[0].upper() if parts_nick else "ИГРОК"
+    last_name = parts_nick[1].upper() if len(parts_nick) > 1 and parts_nick[1] else "ГРАЖДАНИН"
+
+    world_time, world_weather = get_world_time_and_weather()
+    xp_cur = int(p.get("xp", 0))
+    xp_req = max(100, int(p.get("lvl", 1)) * 100)
+    lvl_line = f"{p.get('lvl', 1)} [{xp_cur} / {xp_req} XP]"
+
+    val_font = _load_font(24, bold=True)
+    lvl_font = _load_font(22, bold=True)
+    dark_ink = (56, 40, 34, 255)
+
+    draw.text((340, 152), last_name, fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((340, 242), first_name, fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((340, 332), f"{p.get('hp', 100)}%", fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((340, 422), format_rub(int(p.get("money", 0))), fill=dark_ink, font=val_font, anchor="lm")
+
+    draw.text((675, 152), world_time, fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((675, 242), world_weather.upper(), fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((675, 332), f"{p.get('hunger', 100)}%", fill=dark_ink, font=val_font, anchor="lm")
+    draw.text((675, 422), format_rub(int(p.get("bank", 0))), fill=dark_ink, font=val_font, anchor="lm")
+
+    draw.text((70, 500), lvl_line, fill=dark_ink, font=lvl_font, anchor="lm")
+
+    out = io.BytesIO()
+    canvas.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+
+async def _fetch_user_avatar_bytes(bot: Bot, uid: int) -> bytes | None:
+    try:
+        photos = await bot.get_user_profile_photos(uid, limit=1)
+        if photos and photos.photos and photos.photos[0]:
+            best_photo = photos.photos[0][-1]
+            buf = io.BytesIO()
+            await bot.download(best_photo, destination=buf)
+            return buf.getvalue()
+    except Exception:
+        pass
+    return None
+
+
+def get_family_by_id(fid: Any) -> dict[str, Any] | None:
+    if not fid:
+        return None
+    f_key = str(fid)
+    if f_key in families and isinstance(families[f_key], dict):
+        return normalize_family(families[f_key], f_key)
+    return None
+
+
+def get_player_family(p: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    uid = int(p.get("tg_id", 0))
+    fam_id = p.get("family_id")
+    if fam_id and str(fam_id) in families and isinstance(families[str(fam_id)], dict):
+        f_key = str(fam_id)
+        fdata = normalize_family(families[f_key], f_key)
+        if uid in fdata["members"] or fdata["owner_uid"] == uid:
+            return f_key, fdata
+        p["family_id"] = None
+    for k, fdata in list(families.items()):
+        if isinstance(fdata, dict):
+            norm = normalize_family(fdata, str(k))
+            if norm["owner_uid"] == uid or uid in norm["members"]:
+                p["family_id"] = str(k)
+                return str(k), norm
+    return None, None
+
+
+def get_family_member_rank(fdata: dict[str, Any], uid: int) -> str:
+    if int(fdata.get("owner_uid", 0)) == int(uid):
+        return "Глава"
+    ranks_map = fdata.get("ranks") or {}
+    custom = ranks_map.get(str(uid)) or ranks_map.get(uid)
+    if custom:
+        return str(custom)
+    return "Участник"
+
+
+def get_family_upgrade_cost(fdata: dict[str, Any]) -> int:
+    lvl = max(1, int(fdata.get("level", 1)))
+    return FAMILY_UPGRADE_BASE_COST * lvl
+
+
 class BanMiddleware:
     async def __call__(self, handler, event, data):
         uid = None
@@ -1446,6 +1752,7 @@ class BanMiddleware:
                         u["tempban_until"] = 0.0
                         u["tempban_reason"] = ""
                         save_state()
+
         if uid is not None and maintenance_mode and not is_admin(uid, 1):
             m_text = f"🛠 <b>Технические работы</b>\n{esc(maintenance_reason)}"
             if isinstance(event, Message):
@@ -1453,6 +1760,24 @@ class BanMiddleware:
             elif isinstance(event, CallbackQuery):
                 await event.answer(f"🛠 Технические работы: {maintenance_reason}", show_alert=True)
             return
+
+        if isinstance(event, Message) and uid is not None:
+            state: FSMContext | None = data.get("state")
+            cur_state = await state.get_state() if state else None
+            if cur_state != RegistrationStates.waiting_nickname.state:
+                p = get_player(uid, event.from_user.full_name if event.from_user else "")
+                if not p.get("registered"):
+                    if state:
+                        await state.set_state(RegistrationStates.waiting_nickname)
+                    await safe_answer(
+                        event,
+                        "🪪 <b>Регистрация гражданина</b>\n"
+                        "Для начала игры придумайте и отправьте ваш ник в формате <code>Имя_Фамилия</code>.\n"
+                        "Пример: <code>Никита_Шакуров</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+
         return await handler(event, data)
 
 
@@ -1497,6 +1822,51 @@ dp.message.middleware(BanMiddleware())
 dp.callback_query.middleware(BanMiddleware())
 
 
+@dp.message(RegistrationStates.waiting_nickname)
+async def process_registration_nickname(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    raw = (message.text or "").strip()
+
+    if raw.startswith("/") and not raw.startswith("/start"):
+        await safe_answer(
+            message,
+            "⚠️ Сначала завершите регистрацию: отправьте ник в формате <code>Имя_Фамилия</code> (например, <code>Никита_Шакуров</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    ok, res = validate_rp_nick(raw)
+    if not ok:
+        await safe_answer(message, f"⚠️ {res}", parse_mode="HTML")
+        return
+
+    if is_nick_taken(res, exclude_tg_id=uid):
+        await safe_answer(
+            message,
+            f"❌ Ник <code>{esc(res)}</code> уже занят другим игроком. Введите другой вариант:",
+            parse_mode="HTML",
+        )
+        return
+
+    p["name"] = res
+    p["registered"] = True
+    if not p.get("reg_date"):
+        p["reg_date"] = datetime.now().strftime("%d %B %Y г.")
+    save_state()
+    await state.clear()
+
+    await safe_answer(
+        message,
+        f"✅ Добро пожаловать в область, <b>{esc(p['name'])}</b>!\n"
+        f"Ваш игровой ID: <b><code>#{p['game_id']}</code></b> | Дата регистрации: <b>{esc(p['reg_date'])}</b>\n"
+        f"Стартовый баланс: <b>{p['money']} ₽</b> | Уровень: <b>{p['lvl']}</b>\n\n"
+        f"Совет: укажите возраст через <code>/setage &lt;18..90&gt;</code> и откройте профиль кнопкой <b>«👤 Профиль»</b>.",
+        reply_markup=main_kb(uid),
+        parse_mode="HTML",
+    )
+
+
 def get_user_open_tickets(uid: int) -> list[dict[str, Any]]:
     res = []
     for t in support_tickets.values():
@@ -1512,11 +1882,13 @@ def render_support_menu_kb(uid: int) -> InlineKeyboardMarkup:
     ]
     for t in get_user_open_tickets(uid)[:3]:
         tid = str(t["id"])
-        rows.append([
-            InlineKeyboardButton(text=f"📂 Тикет #{tid}", callback_data=f"sup_view:{tid}"),
-            InlineKeyboardButton(text=f"💬 Дописать #{tid}", callback_data=f"sup_ureply:{tid}"),
-            InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
-        ])
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"📂 Тикет #{tid}", callback_data=f"sup_view:{tid}"),
+                InlineKeyboardButton(text=f"💬 Дописать #{tid}", callback_data=f"sup_ureply:{tid}"),
+                InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1710,11 +2082,13 @@ async def process_user_ticket_reply(message: Message, state: FSMContext, bot: Bo
         return
 
     ticket["status"] = "open"
-    ticket.setdefault("messages", []).append({
-        "from": "player",
-        "name": str(p["name"]),
-        "text": text_body[:1000],
-    })
+    ticket.setdefault("messages", []).append(
+        {
+            "from": "player",
+            "name": str(p["name"]),
+            "text": text_body[:1000],
+        }
+    )
     save_state()
 
     await safe_answer(
@@ -1841,12 +2215,21 @@ async def create_support_ticket(
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
     cur = await state.get_state()
     if cur is None:
-        await safe_answer(message, "Нет активного действия для отмены.", reply_markup=main_kb(message.from_user.id))
+        await safe_answer(message, "Нет активного действия для отмены.", reply_markup=main_kb(uid))
+        return
+    if cur == RegistrationStates.waiting_nickname.state and not p.get("registered"):
+        await safe_answer(
+            message,
+            "⚠️ Нельзя отменить первичную регистрацию. Введите ник в формате <code>Имя_Фамилия</code>.",
+            parse_mode="HTML",
+        )
         return
     await state.clear()
-    await safe_answer(message, "Действие отменено.", reply_markup=main_kb(message.from_user.id))
+    await safe_answer(message, "Действие отменено.", reply_markup=main_kb(uid))
 
 
 @dp.message(Command("tickets"))
@@ -1877,9 +2260,11 @@ async def cmd_tickets(message: Message):
             f"• Тикет <b><code>#{esc(t['id'])}</code></b> [{st_badge}] — <b>{esc(t.get('user_name'))}</b> (<code>#{t.get('game_id')}</code>) | {esc(cat_txt)}\n"
             f"  <i>{esc(last_txt[:100])}</i>"
         )
-        kb_rows.append([
-            InlineKeyboardButton(text=f"🔒 Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}"),
-        ])
+        kb_rows.append(
+            [
+                InlineKeyboardButton(text=f"🔒 Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}"),
+            ]
+        )
     st = get_player(uid, message.from_user.full_name)
     lines.append(f"\nВаш ранг: <b>{esc(get_helper_title(int(st.get('helper_lvl', 0))))}</b> | Ответов: <code>{st.get('helper_answers', 0)}</code>")
     lines.append("Команды: <code>/answer &lt;ID&gt; &lt;текст&gt;</code> | <code>/closeticket &lt;ID&gt;</code> | <code>/helpers</code>")
@@ -1957,20 +2342,24 @@ async def cmd_answer_ticket(message: Message, bot: Bot):
             promo_note = f"\n🎉 Поздравляем! Вы повышены до ранга <b>{esc(get_helper_title(h_lvl + 1))}</b>!"
 
     ticket["status"] = "answered"
-    ticket.setdefault("messages", []).append({
-        "from": "staff",
-        "name": f"{staff['name']} [{h_info['title']}]",
-        "text": reply_text,
-    })
+    ticket.setdefault("messages", []).append(
+        {
+            "from": "staff",
+            "name": f"{staff['name']} [{h_info['title']}]",
+            "text": reply_text,
+        }
+    )
     save_state()
 
     target_uid = int(ticket["user_id"])
-    reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"💬 Ответить в #{tid}", callback_data=f"sup_ureply:{tid}"),
-            InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
+    reply_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"💬 Ответить в #{tid}", callback_data=f"sup_ureply:{tid}"),
+                InlineKeyboardButton(text=f"🔒 Закрыть #{tid}", callback_data=f"sup_uclose:{tid}"),
+            ]
         ]
-    ])
+    )
     await safe_send(
         bot,
         target_uid,
@@ -2052,50 +2441,89 @@ async def cmd_info(message: Message):
             await safe_answer(message, f"❌ Игрок <code>{esc(query)}</code> не найден.", parse_mode="HTML")
             return
 
+    t_uid = int(target["tg_id"])
     fac_key = target.get("faction", "none")
     if fac_key in FACTIONS:
         fac_name = FACTIONS[fac_key]["name"]
         rk = int(target.get("rank", 1))
         rk_title = get_faction_rank_title(fac_key, rk)
-        fac_line = f"🏛 Фракция: <b>{esc(fac_name)}</b> — <b>{esc(rk_title)}</b> (<code>{rk}/13</code>, выговоров: <code>{target.get('f_warns', 0)}/3</code>)"
+        fac_line = (
+            f"🏛 Фракция: <b>{esc(fac_name)}</b> — <b>{esc(rk_title)}</b> "
+            f"(<code>{rk}/13</code>, очки: <code>{target.get('faction_points', 0)}</code>, выговоров: <code>{target.get('f_warns', 0)}/3</code>)"
+        )
     else:
         fac_line = "🏛 Фракция: <b>Гражданский</b>"
 
-    age_txt = f"<b>{target['age']} лет</b>" if target.get("age") else "Не указан"
+    fam_id, fam_data = get_player_family(target)
+    if fam_id and fam_data:
+        fam_line = (
+            f"👨‍👩‍👧‍👦 Семья: <b>{esc(fam_data.get('name'))}</b> (<code>#{esc(fam_id)}</code>, "
+            f"ранг: <b>{esc(get_family_member_rank(fam_data, t_uid))}</b>, общак: <b>{format_rub(int(fam_data.get('balance', 0)))}</b>)"
+        )
+    else:
+        fam_line = "👨‍👩‍👧‍👦 Семья: <b>Не состоит</b>"
+
+    age_txt = f"<b>{target['age']} лет</b>" if target.get("age") else "Не указан (/setage)"
     leader_tag = " 👑 Лидер" if target.get("leader_of") else ""
-    a_lvl = get_admin_lvl(int(target["tg_id"]))
+    rep_val = int(target.get("reputation", 0))
+    rep_title = get_reputation_title(rep_val)
+    xp_cur = int(target.get("xp", 0))
+    xp_req = max(100, int(target.get("lvl", 1)) * 100)
+
+    now = time.time()
+    statuses: list[str] = []
+    if target.get("banned"):
+        statuses.append(f"🚫 Бан ({target.get('ban_reason') or 'причина не указана'})")
+    tb_until = float(target.get("tempban_until", 0.0) or 0.0)
+    if tb_until > now:
+        statuses.append(f"⏳ Темпбан ({format_duration(tb_until - now)})")
+    dm_until = float(target.get("dep_mute_until", 0.0) or 0.0)
+    if dm_until > now:
+        statuses.append(f"🔇 Мут /d ({format_duration(dm_until - now)})")
+    if int(target.get("wanted", 0)) > 0:
+        statuses.append(f"🚨 Розыск {target['wanted']}/6")
+    if int(target.get("fines", 0)) > 0:
+        statuses.append(f"🧾 Штрафы {format_rub(int(target['fines']))}")
+    status_line = "\n📌 Статусы: " + " | ".join(esc(s) for s in statuses) if statuses else "\n📌 Статусы: <b>Чист</b>"
+
+    a_lvl = get_admin_lvl(t_uid)
     h_lvl = int(target.get("helper_lvl", 0))
-    m_lvl = get_media_lvl(int(target["tg_id"]))
+    m_lvl = get_media_lvl(t_uid)
     staff_line = ""
-    if is_admin(uid, 1) or int(target["tg_id"]) == uid:
+    if is_admin(uid, 1) or t_uid == uid:
         staff_line = (
             f"\n🛡 Админ: <b>{esc(get_admin_title(a_lvl))}</b> | 🛟 Хелпер: <b>{esc(get_helper_title(h_lvl))}</b> (<code>{target.get('helper_answers', 0)}</code> отв.)"
             f"\n🎬 Медиа: <b>{esc(get_media_title(m_lvl))}</b> (призов: <code>{target.get('media_prizes_given', 0)}</code>, промо: <code>{target.get('media_promos_created', 0)}</code>)"
         )
 
     vape_txt = (
-        f"{esc(target['vape_name'])} (жижа: <code>{target['vape_liquid']}%</code>, акб: <code>{target['vape_battery']}%</code>)"
+        f"{esc(target['vape_name'])} (жижа: <code>{target['vape_liquid']}%</code>, акб: <code>{target['vape_battery']}%</code>, затяжек: <code>{target.get('vape_puffs', 0)}</code>)"
         if target.get("has_vape")
         else "Нет"
     )
-    owned_biz = [b["name"] for b in businesses.values() if isinstance(b, dict) and b.get("owner_uid") == int(target["tg_id"])]
+    owned_biz = [b["name"] for b in businesses.values() if isinstance(b, dict) and b.get("owner_uid") == t_uid]
     biz_txt = ", ".join(esc(x) for x in owned_biz) if owned_biz else "Нет"
     cars_txt = ", ".join(esc(SHOP_CARS[c]["name"]) for c in target.get("cars", []) if c in SHOP_CARS) or "Нет"
     houses_txt = ", ".join(esc(SHOP_HOUSES[h]["name"]) for h in target.get("houses", []) if h in SHOP_HOUSES) or "Нет"
+    total_cap = int(target["money"]) + int(target["bank"])
 
     await safe_answer(
         message,
-        f"📋 <b>Информация об игроке: {esc(target['name'])}</b> (<code>#{target['game_id']}</code>){leader_tag}\n"
+        f"📋 <b>Досье гражданина: {esc(target['name'])}</b> (<code>#{target['game_id']}</code>){leader_tag}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎂 Возраст: {age_txt} | ⭐ Уровень: <b>{target['lvl']}</b> (<code>{target['xp']}</code> XP)\n"
-        f"💵 Наличные: <b>{target['money']} ₽</b> | 🏦 Банк: <b>{target['bank']} ₽</b>\n"
-        f"❤️ HP: <code>{target['hp']}/100</code> | 🍗 Голод: <code>{target['hunger']}/100</code> | ⚡ Силы: <code>{target['stamina']}/100</code>\n"
-        f"🚨 Розыск: <code>{target['wanted']}/6</code> | 🧾 Штрафы: <b>{target['fines']} ₽</b>\n"
+        f"📅 Регистрация: <b>{esc(target.get('reg_date') or '—')}</b> | 🎂 Возраст: {age_txt}\n"
+        f"🏆 Уровень: <b>{target['lvl']}</b> [<code>{xp_cur} / {xp_req} XP</code>]\n"
+        f"📍 Репутация: <b><code>{rep_val}</code></b> · <i>{esc(rep_title)}</i>\n"
+        f"👛 Кошелёк: <b>{esc(format_rub(int(target['money'])))}</b> | 🏦 Банк: <b>{esc(format_rub(int(target['bank'])))}</b>\n"
+        f"💎 Общий капитал: <b>{esc(format_rub(total_cap))}</b>\n"
+        f"❤️ Здоровье: <code>{target['hp']}/100</code> | 🍗 Сытость: <code>{target['hunger']}/100</code> | ⚡ Силы: <code>{target['stamina']}/100</code>\n"
+        f"🎰 Казино: побед <code>{target['casino_wins']}</code> / поражений <code>{target['casino_losses']}</code>\n"
         f"{fac_line}\n"
+        f"{fam_line}\n"
         f"💨 Вейп: {vape_txt}\n"
-        f"🏢 Бизнес: {biz_txt}\n"
+        f"🏢 Бизнесы: {biz_txt}\n"
         f"🚗 Авто: {cars_txt}\n"
-        f"🏠 Недвижимость: {houses_txt}{staff_line}",
+        f"🏠 Недвижимость: {houses_txt}{status_line}{staff_line}",
         parse_mode="HTML",
     )
 
@@ -2108,6 +2536,20 @@ async def cmd_department_radio(message: Message, bot: Bot):
     rk = int(p.get("rank", 1))
     is_adm = is_admin(uid, 1)
 
+    now = time.time()
+    mute_until = float(p.get("dep_mute_until", 0.0) or 0.0)
+    if mute_until > now and not is_creator(uid):
+        await safe_answer(
+            message,
+            f"🔇 У вас действует мут рации департамента (/d).\n"
+            f"Осталось: <b>{esc(format_duration(mute_until - now))}</b>.",
+            parse_mode="HTML",
+        )
+        return
+    if mute_until > 0 and mute_until <= now:
+        p["dep_mute_until"] = 0.0
+        save_state()
+
     if not is_adm:
         if fid not in FACTIONS or FACTIONS[fid].get("type") == "crime":
             await safe_answer(message, "⛔ Рация департамента (/d) доступна только сотрудникам государственных фракций.")
@@ -2119,16 +2561,6 @@ async def cmd_department_radio(message: Message, bot: Bot):
                 parse_mode="HTML",
             )
             return
-
-    now = time.time()
-    mute_until = float(p.get("dep_mute_until", 0.0) or 0.0)
-    if mute_until > now and not is_adm:
-        await safe_answer(
-            message,
-            f"🔇 У вас мут рации департамента. Осталось: <b>{esc(format_duration(mute_until - now))}</b>.",
-            parse_mode="HTML",
-        )
-        return
 
     last_msg = float(p.get("last_dep_msg", 0.0) or 0.0)
     if not is_adm and (now - last_msg) < DEP_RADIO_COOLDOWN:
@@ -2156,7 +2588,10 @@ async def cmd_department_radio(message: Message, bot: Bot):
 
     if fid in FACTIONS:
         rk_title = get_faction_rank_title(fid, rk)
-        broadcast = f"📻 <b>[D] [{esc(FACTIONS[fid]['name'])}] {esc(rk_title)} {esc(p['name'])} (<code>#{p['game_id']}</code>):</b> {esc(msg_body)}"
+        broadcast = (
+            f"📻 <b>[D] [{esc(FACTIONS[fid]['name'])}] {esc(rk_title)} "
+            f"{esc(p['name'])} (<code>#{p['game_id']}</code>):</b> {esc(msg_body)}"
+        )
     else:
         broadcast = f"📻 <b>[D] [АДМИНИСТРАЦИЯ] {esc(p['name'])} (<code>#{p['game_id']}</code>):</b> {esc(msg_body)}"
 
@@ -2183,34 +2618,61 @@ async def cmd_dmute(message: Message, bot: Bot):
         await safe_answer(message, "⛔ Выдавать мут рации департамента можно с 3 ранга администратора.")
         return
     parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+    if len(parts) != 3 or not parts[1].lstrip("#").isdigit() or not parts[2].isdigit():
         await safe_answer(message, "Формат: <code>/dmute &lt;игровой_ID&gt; &lt;минуты&gt;</code> (0 — снять мут)", parse_mode="HTML")
         return
-    gid = int(parts[1])
+    gid = int(parts[1].lstrip("#"))
     mins = int(parts[2])
     target = find_player_by_game_id(gid)
     if not target:
         await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
         return
+
+    t_uid = int(target["tg_id"])
+    t_key = str(t_uid)
     if mins <= 0:
         target["dep_mute_until"] = 0.0
+        if t_key in users and isinstance(users[t_key], dict):
+            users[t_key]["dep_mute_until"] = 0.0
         save_state()
         await safe_answer(message, f"🔊 Мут рации департамента снят с <b>{esc(target['name'])}</b> (<code>#{gid}</code>).", parse_mode="HTML")
+        await safe_send(bot, t_uid, "🔊 С вас снят мут рации департамента (/d).", parse_mode="HTML")
         return
-    target["dep_mute_until"] = time.time() + mins * 60
+
+    until_ts = time.time() + mins * 60
+    target["dep_mute_until"] = until_ts
+    if t_key in users and isinstance(users[t_key], dict):
+        users[t_key]["dep_mute_until"] = until_ts
     save_state()
-    await safe_answer(message, f"🔇 Игроку <b>{esc(target['name'])}</b> (<code>#{gid}</code>) выдан мут /d на <b>{mins} мин.</b>", parse_mode="HTML")
-    await safe_send(bot, int(target["tg_id"]), f"🔇 Вам выдан мут рации департамента (/d) на <b>{mins} мин.</b>", parse_mode="HTML")
+    await safe_answer(
+        message,
+        f"🔇 Игроку <b>{esc(target['name'])}</b> (<code>#{gid}</code>) выдан мут /d на <b>{mins} мин.</b>",
+        parse_mode="HTML",
+    )
+    await safe_send(bot, t_uid, f"🔇 Вам выдан мут рации департамента (/d) на <b>{mins} мин.</b>", parse_mode="HTML")
 
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
     p = get_player(uid, message.from_user.full_name)
+
+    if not p.get("registered"):
+        await state.set_state(RegistrationStates.waiting_nickname)
+        await safe_answer(
+            message,
+            "🇷🇺 Добро пожаловать в <b>Criminal Russia RP</b>!\n\n"
+            "Для создания паспорта гражданина введите ваш ник в формате <code>Имя_Фамилия</code>.\n"
+            "Пример: <code>Никита_Шакуров</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
     age_txt = f"{p['age']} лет" if p.get("age") else "Не указан (/setage)"
     await safe_answer(
         message,
-        f"🇷🇺 Добро пожаловать в <b>Criminal Russia RP</b>!\n"
+        f"🇷🇺 С возвращением в <b>Criminal Russia RP</b>!\n"
         f"Ник: <b>{esc(p['name'])}</b> | Игровой ID: <b><code>#{p['game_id']}</code></b> | Возраст: <b>{esc(age_txt)}</b>\n"
         f"Наличные: <b>{p['money']} ₽</b> | Банк: <b>{p['bank']} ₽</b> | Уровень: <b>{p['lvl']}</b>\n"
         f"❤️ HP: <code>{p['hp']}/100</code> | 🍗 Голод: <code>{p['hunger']}/100</code> | ⚡ Выносливость: <code>{p['stamina']}/100</code>",
@@ -2225,10 +2687,10 @@ async def cmd_help(message: Message):
     uid = message.from_user.id
     lines = [
         "📖 <b>Основные команды и механики:</b>",
-        "• <code>/start</code> — запуск и обновление меню",
+        "• <code>/start</code> — запуск, регистрация и обновление меню",
         "• <code>/setnick &lt;Имя_Фамилия&gt;</code> — сменить RP-ник (20 000 ₽)",
         "• <code>/setage &lt;18..90&gt;</code> — установить игровой возраст персонажа",
-        "• <code>/info [ID или Ник]</code> — подробная карточка игрока",
+        "• <code>/info [ID или Ник]</code> — подробное досье игрока",
         "• <code>/vape</code> или кнопка «💨 Вейп» — покупка, заправка, зарядка и затяжки",
         "• <code>/d &lt;сообщение&gt;</code> — рация департамента (с 6/13 ранга госструктур)",
         "• <code>/pay &lt;ID&gt; &lt;сумма&gt;</code> — перевести деньги игроку (комиссия 3%)",
@@ -2240,6 +2702,7 @@ async def cmd_help(message: Message):
         "• <code>/support &lt;текст&gt;</code> — написать в поддержку (или кнопка «🎫 Поддержка»)",
         "• <code>/members [фракция]</code> — состав фракции (13 званий, включая Суд)",
         "• <code>/r &lt;текст&gt;</code>, <code>/fapps</code>, <code>/faccept</code>, <code>/fdecline</code>, <code>/fdeposit</code>, <code>/fwarn</code> — фракции",
+        "• <code>/createfam &lt;Название&gt;</code> или кнопка «👨‍👩‍👧‍👦 Семья» — создание и управление семьёй",
         "",
         "🚓 <b>ДПС / ППС / ФСБ / ФСИН / МВД / ВЧ:</b>",
         "• <code>/wanted &lt;ID&gt; &lt;1..6&gt;</code> — выдать розыск",
@@ -2261,28 +2724,30 @@ async def cmd_help(message: Message):
     if is_media(uid, 8) or is_admin(uid, 11):
         lines.append("• <code>/setmediarank &lt;ID&gt; &lt;0..8&gt;</code> — назначить ранг медиа (8 ранг медиа / админ 11+)")
     if is_admin(uid, 1):
-        lines.extend([
-            "",
-            f"🛡 <b>Администрация (ранги 1–{ADMIN_MAX_RANK}):</b>",
-            f"• <code>/admins</code> — список администрации и ранги 1–{ADMIN_MAX_RANK}",
-            "• <code>/players</code> — список игроков",
-            "• <code>/changename &lt;ID&gt; &lt;Имя_Фамилия&gt;</code> — сменить ник игроку",
-            "• <code>/addpromo &lt;КОД&gt; &lt;сумма&gt; &lt;активаций&gt;</code> — создать промокод",
-            "• <code>/delpromo &lt;КОД&gt;</code> — удалить промокод",
-            "• <code>/sethelper &lt;ID&gt; &lt;0..8&gt;</code> и <code>/helpers</code> — ранги хелперов (1–8)",
-            "• <code>/setmedia &lt;ID&gt; &lt;0..8&gt;</code> — выдать или изменить ранг медиа (0 — снять)",
-            f"• <code>/setadmin &lt;ID&gt; &lt;0..{ADMIN_MAX_RANK}&gt;</code> — выдать уровень админа",
-            "• <code>/setleader &lt;ID&gt; &lt;фракция|none&gt;</code> — назначить лидера",
-            "• <code>/dmute &lt;ID&gt; &lt;минуты&gt;</code> — мут рации департамента",
-            "• <code>/ban &lt;ID&gt; [причина]</code> и <code>/unban &lt;ID&gt;</code>",
-            "• <code>/tempban &lt;ID&gt; &lt;срок&gt; [причина]</code> и <code>/untempban &lt;ID&gt;</code>",
-            "• <code>/resetplayer &lt;ID&gt;</code> и <code>/wipeall CONFIRM</code>",
-        ])
+        lines.extend(
+            [
+                "",
+                f"🛡 <b>Администрация (ранги 1–{ADMIN_MAX_RANK}):</b>",
+                f"• <code>/admins</code> — список администрации и ранги 1–{ADMIN_MAX_RANK}",
+                "• <code>/players</code> — список игроков",
+                "• <code>/changename &lt;ID&gt; &lt;Имя_Фамилия&gt;</code> — сменить ник игроку",
+                "• <code>/addpromo &lt;КОД&gt; &lt;сумма&gt; &lt;активаций&gt;</code> — создать промокод",
+                "• <code>/delpromo &lt;КОД&gt;</code> — удалить промокод",
+                "• <code>/sethelper &lt;ID&gt; &lt;0..8&gt;</code> и <code>/helpers</code> — ранги хелперов (1–8)",
+                "• <code>/setmedia &lt;ID&gt; &lt;0..8&gt;</code> — выдать или изменить ранг медиа (0 — снять)",
+                f"• <code>/setadmin &lt;ID&gt; &lt;0..{ADMIN_MAX_RANK}&gt;</code> — выдать уровень админа",
+                "• <code>/setleader &lt;ID&gt; &lt;фракция|none&gt;</code> — назначить лидера",
+                "• <code>/dmute &lt;ID&gt; &lt;минуты&gt;</code> — мут рации департамента",
+                "• <code>/ban &lt;ID&gt; [причина]</code> и <code>/unban &lt;ID&gt;</code>",
+                "• <code>/tempban &lt;ID&gt; &lt;срок&gt; [причина]</code> и <code>/untempban &lt;ID&gt;</code>",
+                "• <code>/resetplayer &lt;ID&gt;</code> и <code>/wipeall CONFIRM</code>",
+            ]
+        )
     await safe_answer(message, "\n".join(lines), reply_markup=main_kb(uid), parse_mode="HTML")
 
 
 @dp.message(F.text == "👤 Профиль")
-async def btn_profile(message: Message):
+async def btn_profile(message: Message, bot: Bot):
     uid = message.from_user.id
     p = get_player(uid, message.from_user.full_name)
     fac_key = p.get("faction", "none")
@@ -2293,6 +2758,16 @@ async def btn_profile(message: Message):
         fac_line = f"🏛 Фракция: <b>{esc(fac_name)}</b> — <b>{esc(rk_title)}</b> (<code>{p['rank']}/13</code>, очки: <code>{p['faction_points']}</code>{warns_txt})"
     else:
         fac_line = "🏛 Фракция: <b>Гражданский</b>"
+
+    fam_id, fam_data = get_player_family(p)
+    if fam_id and fam_data:
+        fam_line = (
+            f"👨‍👩‍👧‍👦 Семья: <b>{esc(fam_data.get('name'))}</b> (<code>#{esc(fam_id)}</code> · "
+            f"<b>{esc(get_family_member_rank(fam_data, uid))}</b>)"
+        )
+    else:
+        fam_line = "👨‍👩‍👧‍👦 Семья: <b>нет</b>"
+
     role_tag = " 👑 Лидер" if p.get("leader_of") else ""
     a_lvl = get_admin_lvl(uid)
     admin_line = f"\n🛡 Администрация: <b>{esc(get_admin_title(a_lvl))}</b>" if is_creator(uid) or a_lvl > 0 else ""
@@ -2305,25 +2780,44 @@ async def btn_profile(message: Message):
         if p.get("has_vape")
         else "\n💨 Вейп: <b>Нет</b>"
     )
-    cars_txt = ", ".join(esc(SHOP_CARS[c]["name"]) for c in p["cars"] if c in SHOP_CARS) or "Нет"
-    houses_txt = ", ".join(esc(SHOP_HOUSES[h]["name"]) for h in p["houses"] if h in SHOP_HOUSES) or "Нет"
-    age_txt = f"<b>{p['age']} лет</b>" if p.get("age") else "Не указан (/setage)"
 
-    await safe_answer(
-        message,
-        f"👤 <b>Профиль: {esc(p['name'])}</b> (<code>#{p['game_id']}</code>)\n"
-        f"🎂 Игровой возраст: {age_txt}\n"
-        f"⭐ Уровень: <b>{p['lvl']}</b> (опыт: <code>{p['xp']}</code>)\n"
-        f"💵 Наличные: <b>{p['money']} ₽</b> | 🏦 Банк: <b>{p['bank']} ₽</b>\n"
-        f"❤️ Здоровье: <code>{p['hp']}/100</code> | 🍗 Голод: <code>{p['hunger']}/100</code> | ⚡ Выносливость: <code>{p['stamina']}/100</code>\n"
-        f"🎰 Казино: побед <code>{p['casino_wins']}</code> / поражений <code>{p['casino_losses']}</code>\n"
-        f"🚨 Розыск: <code>{p['wanted']}/6</code> | 🧾 Штрафы: <b>{p['fines']} ₽</b>\n"
-        f"{fac_line}{role_tag}{admin_line}{helper_line}{media_line}{vape_line}\n"
-        f"🚗 Авто: {cars_txt}\n"
-        f"🏠 Недвижимость: {houses_txt}",
-        reply_markup=main_kb(uid),
-        parse_mode="HTML",
+    house_cnt = len(p.get("houses") or [])
+    car_cnt = len(p.get("cars") or [])
+    biz_cnt = sum(1 for b in businesses.values() if isinstance(b, dict) and b.get("owner_uid") == uid)
+    inv_used = car_cnt + house_cnt + biz_cnt + (1 if p.get("has_vape") else 0)
+    inv_total = 30
+
+    age_txt = f"<b>{p['age']} лет</b>" if p.get("age") else "Не указан (/setage)"
+    rep_val = int(p.get("reputation", 0))
+    rep_title = get_reputation_title(rep_val)
+    xp_cur = int(p.get("xp", 0))
+    xp_req = max(100, int(p.get("lvl", 1)) * 100)
+
+    caption = (
+        f"👤 <b>Паспорт · РФ</b>\n"
+        f"<b>{esc(p['name'])}</b> · ID <b><code>{p['game_id']}</code></b>\n"
+        f"Регистрация: <i>{esc(p.get('reg_date') or '—')}</i>\n\n"
+        f"🏆 Уровень: <b>{p['lvl']}</b> [<code>{xp_cur} / {xp_req} XP</code>]\n"
+        f"🎂 Возраст: {age_txt}\n"
+        f"📍 Репутация области: <b><code>{rep_val}</code></b> · <i>{esc(rep_title)}</i>\n"
+        f"❤️ <code>{p['hp']}%</code> · 🍗 <code>{p['hunger']}%</code> · ⚡ <code>{p['stamina']}%</code>\n\n"
+        f"🏠 Дома: <code>{house_cnt}</code> · 🚗 Авто: <code>{car_cnt}</code> · 🏢 Бизнесы: <code>{biz_cnt}/3</code>\n"
+        f"{fam_line} · 🎒 <code>{inv_used}/{inv_total}</code>\n"
+        f"{fac_line}{role_tag}{admin_line}{helper_line}{media_line}{vape_line}\n\n"
+        f"<i>Подробности — в разделах ниже или в <code>/info</code>.</i>"
     )
+
+    avatar_bytes = await _fetch_user_avatar_bytes(bot, uid)
+    card_bytes = _build_passport_card_bytes(p, avatar_bytes=avatar_bytes)
+    if card_bytes:
+        photo = BufferedInputFile(card_bytes, filename=f"passport_{p['game_id']}.png")
+        try:
+            await message.answer_photo(photo=photo, caption=caption, reply_markup=main_kb(uid), parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await safe_answer(message, caption, reply_markup=main_kb(uid), parse_mode="HTML")
 
 
 def render_vape_menu_kb(p: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -2391,7 +2885,7 @@ async def cmd_vape(message: Message):
 @dp.callback_query(F.data == "vape_shop")
 async def cb_vape_shop(callback: CallbackQuery):
     uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
+    get_player(uid, callback.from_user.full_name)
     rows = [
         [
             InlineKeyboardButton(
@@ -2642,6 +3136,7 @@ async def cmd_setnick(message: Message):
     old_nick = p["name"]
     p["money"] = int(p["money"]) - NICK_CHANGE_COST
     p["name"] = new_nick
+    p["registered"] = True
     p["last_nick_change"] = now
     save_state()
 
@@ -2684,6 +3179,7 @@ async def cmd_changename(message: Message, bot: Bot):
 
     old_nick = target["name"]
     target["name"] = new_nick
+    target["registered"] = True
     save_state()
 
     await safe_answer(
@@ -3404,15 +3900,19 @@ async def render_biz_menu(target_msg: Message, uid: int, edit: bool = False):
                 f"• <b>{esc(b['name'])}</b> <i>(Ваш бизнес)</i> — доход <code>{income_hr} ₽/ч</code>, к сбору: <b>{pending} ₽</b>"
             )
             refund = int(int(b["price"]) * 0.7)
-            kb_rows.append([
-                InlineKeyboardButton(text=f"💰 Собрать ({pending} ₽)", callback_data=f"biz_take:{bid}"),
-                InlineKeyboardButton(text=f"🏷 Продать ({refund} ₽)", callback_data=f"biz_sell:{bid}"),
-            ])
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(text=f"💰 Собрать ({pending} ₽)", callback_data=f"biz_take:{bid}"),
+                    InlineKeyboardButton(text=f"🏷 Продать ({refund} ₽)", callback_data=f"biz_sell:{bid}"),
+                ]
+            )
         elif owner_uid is None:
             lines.append(f"• <b>{esc(b['name'])}</b> — цена <b>{b['price']} ₽</b>, доход <code>{income_hr} ₽/ч</code> <i>(Свободен)</i>")
-            kb_rows.append([
-                InlineKeyboardButton(text=f"🛒 Купить {b['name']}", callback_data=f"biz_buy:{bid}")
-            ])
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(text=f"🛒 Купить {b['name']}", callback_data=f"biz_buy:{bid}")
+                ]
+            )
         else:
             lines.append(
                 f"• <b>{esc(b['name'])}</b> — владелец: <b>{esc(b.get('owner_name') or 'Игрок')}</b>, доход <code>{income_hr} ₽/ч</code>"
@@ -3676,7 +4176,7 @@ def render_media_ranks_table() -> str:
 @dp.message(Command("setmediarank"))
 async def cmd_setmediarank(message: Message, bot: Bot):
     uid = message.from_user.id
-    actor = get_player(uid, message.from_user.full_name)
+    get_player(uid, message.from_user.full_name)
     actor_m_lvl = get_media_lvl(uid)
     can_manage = is_admin(uid, 11) or (actor_m_lvl >= 8)
     if not can_manage:
@@ -4130,26 +4630,6 @@ async def cmd_untempban(message: Message):
     await safe_answer(message, f"✅ Временный бан с игрока <b>{esc(target['name'])}</b> (<code>#{gid}</code>) снят.", parse_mode="HTML")
 
 
-def get_family_by_id(fid: Any) -> dict[str, Any] | None:
-    if not fid:
-        return None
-    return families.get(str(fid))
-
-
-def get_player_family(p: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    uid = int(p.get("tg_id", 0))
-    fam_id = p.get("family_id")
-    if fam_id and str(fam_id) in families:
-        return str(fam_id), families[str(fam_id)]
-    for k, fdata in families.items():
-        if isinstance(fdata, dict):
-            members = fdata.get("members") or []
-            if fdata.get("owner_uid") == uid or uid in members:
-                p["family_id"] = str(k)
-                return str(k), fdata
-    return None, None
-
-
 @dp.message(F.text == "🏠 Недвижимость")
 async def btn_houses(message: Message):
     uid = message.from_user.id
@@ -4168,13 +4648,17 @@ async def render_houses_menu(target_msg: Message, uid: int, edit: bool = False):
         lines.append(f"• <b>{esc(h['name'])}</b> — {status}, бонус банка: <code>+{h['bonus_bank']} ₽/смена</code>")
         if has_it:
             refund = int(int(h["price"]) * 0.7)
-            rows.append([
-                InlineKeyboardButton(text=f"🏷 Продать {h['name']} ({refund} ₽)", callback_data=f"house_sell:{hid}")
-            ])
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🏷 Продать {h['name']} ({refund} ₽)", callback_data=f"house_sell:{hid}")
+                ]
+            )
         else:
-            rows.append([
-                InlineKeyboardButton(text=f"🛒 Купить {h['name']}", callback_data=f"house_buy:{hid}")
-            ])
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🛒 Купить {h['name']}", callback_data=f"house_buy:{hid}")
+                ]
+            )
     kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     text = "\n".join(lines)
     if edit:
@@ -4243,13 +4727,17 @@ async def render_cars_menu(target_msg: Message, uid: int, edit: bool = False):
         lines.append(f"• <b>{esc(c['name'])}</b> — {status}, бонус смены: <code>+{c['bonus_work']} ₽</code>")
         if has_it:
             refund = int(int(c["price"]) * 0.7)
-            rows.append([
-                InlineKeyboardButton(text=f"🏷 Продать {c['name']} ({refund} ₽)", callback_data=f"car_sell:{cid}")
-            ])
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🏷 Продать {c['name']} ({refund} ₽)", callback_data=f"car_sell:{cid}")
+                ]
+            )
         else:
-            rows.append([
-                InlineKeyboardButton(text=f"🛒 Купить {c['name']}", callback_data=f"car_buy:{cid}")
-            ])
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🛒 Купить {c['name']}", callback_data=f"car_buy:{cid}")
+                ]
+            )
     kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     text = "\n".join(lines)
     if edit:
@@ -4300,9 +4788,112 @@ async def cb_car_sell(callback: CallbackQuery):
         await render_cars_menu(callback.message, uid, edit=True)
 
 
+def render_family_card_text(fid: str, fdata: dict[str, Any], uid: int) -> str:
+    norm = normalize_family(fdata, fid)
+    members = norm["members"]
+    max_members = int(norm["max_members"])
+    cars = norm["cars"]
+    max_cars = int(norm["max_cars"])
+    weapons = norm["weapons"]
+    tokens = int(norm["tokens"])
+    rep = int(norm["reputation"])
+    contracts_done = int(norm["contracts_done"])
+    your_rank = get_family_member_rank(norm, uid)
+    upg_cost = get_family_upgrade_cost(norm)
+    mansion_txt = norm["mansion_name"] if norm["has_mansion"] else "нет"
+    tanker_txt = f"{norm['tanker_fuel']} л." if norm["tanker_fuel"] > 0 else "пусто"
+    wh_txt = f"{norm['warehouse_items']} шт." if norm["warehouse_items"] > 0 else "пусто"
+
+    member_lines = []
+    for m_uid in members[:12]:
+        m_u = users.get(str(m_uid))
+        m_name = str(m_u.get("name")) if isinstance(m_u, dict) and m_u.get("name") else f"Игрок_{m_uid}"
+        m_rk = get_family_member_rank(norm, m_uid)
+        member_lines.append(f"• {esc(m_name)} · {esc(m_rk)}")
+
+    cars_txt = ", ".join(esc(SHOP_CARS[c]["name"] if c in SHOP_CARS else c) for c in cars) if cars else "<i>пусто</i>"
+    weapons_txt = (
+        ", ".join(esc(FAMILY_WEAPONS[w]["name"] if w in FAMILY_WEAPONS else w) for w in weapons)
+        if weapons
+        else "<i>пусто · купить в арсенале семьи</i>"
+    )
+
+    return (
+        f"👨‍👩‍👧‍👦 <b>Семья «{esc(norm['name'])}»</b> (ур. <code>{norm['level']}</code>)\n"
+        f"👥 Состав: <code>{len(members)}/{max_members}</code>\n"
+        f"🚗 Автопарк: <code>{len(cars)}/{max_cars}</code>\n"
+        f"🔫 Арсенал: <code>{len(weapons)}</code>\n"
+        f"🪙 Семейные жетоны: <code>{tokens}</code>\n"
+        f"🏅 Репутация: <code>{rep}</code>\n"
+        f"📋 Контракты сегодня: <code>{contracts_done}/{FAMILY_DAILY_CONTRACTS_LIMIT}</code>\n"
+        f"🎖 Ваш ранг: <b>{esc(your_rank)}</b>\n"
+        f"⬆️ Апгрейд: <b>{esc(format_rub(upg_cost))}</b>\n"
+        f"🏦 Казна семьи: <b>{esc(format_rub(int(norm['balance'])))}</b>\n\n"
+        f"👥 <b>Участники</b>\n"
+        + ("\n".join(member_lines) if member_lines else "• <i>нет</i>")
+        + f"\n\n🚗 <b>Автопарк</b>\n{cars_txt}\n\n"
+        f"🔫 <b>Оружие</b>\n"
+        f"<i>{weapons_txt}</i>\n"
+        f"<i>Казна расходуется только на общий особняк, транспорт и арсенал; вывода денег нет.</i>\n"
+        f"🏠 Особняк: <b>{esc(mansion_txt)}</b> | 📦 Склад: <code>{esc(wh_txt)}</code> | 🛢 Танкер: <code>{esc(tanker_txt)}</code>"
+    )
+
+
+def render_family_menu_kb(fid: str, fdata: dict[str, Any], uid: int) -> InlineKeyboardMarkup:
+    is_owner = int(fdata.get("owner_uid", 0)) == int(uid)
+    rows = [
+        [
+            InlineKeyboardButton(text="✉️ Пригласить", callback_data=f"fam_inv_ask:{fid}"),
+            InlineKeyboardButton(text="⬆️ Апгрейд", callback_data=f"fam_upg:{fid}"),
+            InlineKeyboardButton(text="💰 Казна", callback_data=f"fam_dep_ask:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🏠 Особняк", callback_data=f"fam_mansion:{fid}"),
+            InlineKeyboardButton(text="🚗 Автопарк", callback_data=f"fam_cars:{fid}"),
+            InlineKeyboardButton(text="🔫 Арсенал", callback_data=f"fam_armory:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 Контракт", callback_data=f"fam_contract:{fid}"),
+            InlineKeyboardButton(text="📦 Склад", callback_data=f"fam_wh:{fid}"),
+            InlineKeyboardButton(text="🛒 Магазин с.", callback_data=f"fam_shop:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🏆 Рейтинг", callback_data="fam_rating"),
+            InlineKeyboardButton(text="🛢 Танкер", callback_data=f"fam_tanker:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🎖 Ранги", callback_data=f"fam_ranks:{fid}"),
+            InlineKeyboardButton(text="👥 Состав", callback_data=f"fam_roster:{fid}"),
+            InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"fam_rename_ask:{fid}"),
+        ],
+    ]
+    if is_owner:
+        rows.append([InlineKeyboardButton(text="🗑 Распустить семью", callback_data=f"fam_disband:{fid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🚪 Покинуть семью", callback_data=f"fam_leave:{fid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_or_edit_family_card(message: Message, fid: str, uid: int, edit: bool = False) -> None:
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await safe_answer(message, "❌ Семья не найдена.", reply_markup=main_kb(uid))
+        return
+    txt = render_family_card_text(fid, fdata, uid)
+    kb = render_family_menu_kb(fid, fdata, uid)
+    if edit:
+        try:
+            await message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    await safe_answer(message, txt, reply_markup=kb, parse_mode="HTML")
+
+
 @dp.message(F.text == "👨‍👩‍👧‍👦 Семья")
-async def btn_family(message: Message):
+async def btn_family(message: Message, state: FSMContext):
     uid = message.from_user.id
+    await state.clear()
     p = get_player(uid, message.from_user.full_name)
     fid, fdata = get_player_family(p)
     if not fid or not fdata:
@@ -4310,39 +4901,19 @@ async def btn_family(message: Message):
             message,
             "👨‍👩‍👧‍👦 <b>Семьи</b>\n"
             "Вы пока не состоите в семье.\n"
-            "Создать семью (стоимость <code>50 000 ₽</code>): <code>/createfam &lt;Название&gt;</code>",
+            f"Создать семью (стоимость <code>{format_rub(FAMILY_CREATE_COST)}</code>): <code>/createfam &lt;Название&gt;</code>",
             reply_markup=main_kb(uid),
             parse_mode="HTML",
         )
         return
-
-    members = list(fdata.get("members") or [])
-    if uid not in members:
-        members.append(uid)
-        fdata["members"] = members
-    balance = int(fdata.get("balance", 0))
-    owner_name = fdata.get("owner_name") or "Глава"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Вложить 5 000 ₽", callback_data=f"fam_dep:{fid}:5000"),
-            InlineKeyboardButton(text="💸 Снять 5 000 ₽", callback_data=f"fam_take:{fid}:5000"),
-        ],
-        [InlineKeyboardButton(text="🚪 Покинуть семью", callback_data=f"fam_leave:{fid}")],
-    ])
-    await safe_answer(
-        message,
-        f"👨‍👩‍👧‍👦 <b>Семья «{esc(fdata.get('name', fid))}»</b> (<code>#{esc(fid)}</code>)\n"
-        f"👑 Глава: <b>{esc(owner_name)}</b> | Участников: <b><code>{len(members)}</code></b>\n"
-        f"🏦 Общак семьи: <b>{balance} ₽</b>",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    save_state()
+    await send_or_edit_family_card(message, fid, uid, edit=False)
 
 
 @dp.message(Command("createfam"))
-async def cmd_createfam(message: Message):
+async def cmd_createfam(message: Message, state: FSMContext):
     uid = message.from_user.id
+    await state.clear()
     p = get_player(uid, message.from_user.full_name)
     fid, _ = get_player_family(p)
     if fid:
@@ -4353,65 +4924,437 @@ async def cmd_createfam(message: Message):
         await safe_answer(message, "Формат: <code>/createfam &lt;Название семьи&gt;</code>", parse_mode="HTML")
         return
     fam_name = parts[1].strip()[:32]
-    cost = 50000
-    if p["money"] < cost:
-        await safe_answer(message, f"Для создания семьи нужно <b>{cost} ₽</b> наличными.", parse_mode="HTML")
+    if int(p["money"]) < FAMILY_CREATE_COST:
+        await safe_answer(
+            message,
+            f"Для создания семьи нужно <b>{esc(format_rub(FAMILY_CREATE_COST))}</b> наличными.",
+            parse_mode="HTML",
+        )
         return
 
     new_id = str(len(families) + 1)
     while new_id in families:
         new_id = str(int(new_id) + 1)
 
-    p["money"] -= cost
+    p["money"] = int(p["money"]) - FAMILY_CREATE_COST
     p["family_id"] = new_id
-    families[new_id] = {
-        "id": new_id,
-        "name": fam_name,
-        "owner_uid": uid,
-        "owner_name": p["name"],
-        "members": [uid],
-        "balance": 0,
-    }
+    families[new_id] = normalize_family(
+        {
+            "id": new_id,
+            "name": fam_name,
+            "owner_uid": uid,
+            "owner_name": p["name"],
+            "members": [uid],
+            "balance": 0,
+            "tokens": 1,
+            "reputation": 10,
+        },
+        new_id,
+    )
     save_state()
-    await safe_answer(message, f"🎉 Семья <b>«{esc(fam_name)}»</b> (<code>#{esc(new_id)}</code>) создана!", reply_markup=main_kb(uid), parse_mode="HTML")
+    await safe_answer(
+        message,
+        f"🎉 Семья <b>«{esc(fam_name)}»</b> (<code>#{esc(new_id)}</code>) создана!",
+        reply_markup=main_kb(uid),
+        parse_mode="HTML",
+    )
+    await send_or_edit_family_card(message, new_id, uid, edit=False)
 
 
-@dp.callback_query(F.data.startswith("fam_dep:"))
-async def cb_fam_dep(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("fam_inv_ask:"))
+async def cb_fam_inv_ask(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    _, fid, amt_s = callback.data.split(":", 2)
-    amt = int(amt_s)
-    fdata = families.get(fid)
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) != uid:
+        await callback.answer("Приглашать участников может только Глава семьи", show_alert=True)
+        return
+    if len(fdata["members"]) >= int(fdata["max_members"]):
+        await callback.answer("Достигнут лимит участников! Сделайте апгрейд семьи.", show_alert=True)
+        return
+    await state.update_data(fam_target_id=fid)
+    await state.set_state(FamilyStates.inviting_member)
+    await callback.answer()
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            "✉️ Введите <b>игровой ID</b> игрока (например, <code>102</code>) для приглашения в семью (или <code>/cancel</code>):",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(FamilyStates.inviting_member)
+async def process_fam_invite(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    raw = (message.text or "").strip().lstrip("#")
+    data = await state.get_data()
+    fid = str(data.get("fam_target_id") or "")
+    await state.clear()
+
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) != uid:
+        await safe_answer(message, "❌ Недостаточно прав для приглашения.", reply_markup=main_kb(uid))
+        return
+    if not raw.isdigit():
+        await safe_answer(message, "⚠️ Укажите числовой игровой ID игрока.", reply_markup=main_kb(uid))
+        return
+
+    target = find_player_by_game_id(int(raw))
+    if not target:
+        await safe_answer(message, f"❌ Игрок <code>#{raw}</code> не найден.", reply_markup=main_kb(uid), parse_mode="HTML")
+        return
+
+    t_uid = int(target["tg_id"])
+    t_fid, _ = get_player_family(target)
+    if t_fid:
+        await safe_answer(message, "⚠️ Этот игрок уже состоит в семье.", reply_markup=main_kb(uid))
+        return
+    if len(fdata["members"]) >= int(fdata["max_members"]):
+        await safe_answer(message, "⚠️ В семье нет свободных мест. Улучшите семью через «⬆️ Апгрейд».", reply_markup=main_kb(uid))
+        return
+
+    fdata["members"].append(t_uid)
+    target["family_id"] = fid
+    save_state()
+
+    await safe_answer(
+        message,
+        f"✅ Игрок <b>{esc(target['name'])}</b> (<code>#{raw}</code>) принят в семью <b>«{esc(fdata['name'])}»</b>!",
+        reply_markup=main_kb(uid),
+        parse_mode="HTML",
+    )
+    await safe_send(
+        bot,
+        t_uid,
+        f"👨‍👩‍👧‍👦 Вас пригласили и приняли в семью <b>«{esc(fdata['name'])}»</b>! Нажмите «👨‍👩‍👧‍👦 Семья» для просмотра.",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("fam_upg:"))
+async def cb_fam_upg(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
     if not fdata:
         await callback.answer("Семья не найдена", show_alert=True)
         return
-    if p["money"] < amt:
-        await callback.answer(f"Не хватает {amt} ₽ наличными", show_alert=True)
+    if int(fdata["owner_uid"]) != uid:
+        await callback.answer("Улучшать семью может только Глава", show_alert=True)
         return
-    p["money"] -= amt
-    fdata["balance"] = int(fdata.get("balance", 0)) + amt
+
+    cost = get_family_upgrade_cost(fdata)
+    if int(fdata["balance"]) < cost:
+        await callback.answer(f"В казне семьи нужно {format_rub(cost)} (сейчас {format_rub(int(fdata['balance']))})", show_alert=True)
+        return
+
+    fdata["balance"] = int(fdata["balance"]) - cost
+    fdata["level"] = int(fdata["level"]) + 1
+    fdata["max_members"] = int(fdata["max_members"]) + 4
+    fdata["max_cars"] = int(fdata["max_cars"]) + 2
+    fdata["reputation"] = int(fdata["reputation"]) + 30
     save_state()
-    await callback.answer(f"Вложено +{amt} ₽ в общак!", show_alert=True)
+
+    await callback.answer(f"Семья улучшена до {fdata['level']} уровня!", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
 
 
-@dp.callback_query(F.data.startswith("fam_take:"))
-async def cb_fam_take(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("fam_dep_ask:"))
+async def cb_fam_dep_ask(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
-    _, fid, amt_s = callback.data.split(":", 2)
-    amt = int(amt_s)
-    fdata = families.get(fid)
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata or int(p.get("tg_id", 0)) not in fdata["members"]:
+        await callback.answer("Вы не состоите в этой семье", show_alert=True)
+        return
+    await state.update_data(fam_target_id=fid)
+    await state.set_state(FamilyStates.depositing_treasury)
+    await callback.answer()
+    if callback.message:
+        await safe_answer(
+            callback.message,
+            f"💰 Введите сумму для пополнения казны семьи (наличные: <b>{p['money']} ₽</b>) или <code>/cancel</code>:",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(FamilyStates.depositing_treasury)
+async def process_fam_deposit(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    raw = (message.text or "").strip().replace(" ", "")
+    data = await state.get_data()
+    fid = str(data.get("fam_target_id") or "")
+    await state.clear()
+
+    fdata = get_family_by_id(fid)
+    if not fdata or uid not in fdata["members"]:
+        await safe_answer(message, "❌ Семья не найдена.", reply_markup=main_kb(uid))
+        return
+    if not raw.isdigit():
+        await safe_answer(message, "⚠️ Введите сумму числом.", reply_markup=main_kb(uid))
+        return
+    amount = int(raw)
+    if amount < 500 or amount > 50_000_000:
+        await safe_answer(message, "⚠️ Сумма пополнения — от <code>500 ₽</code> до <code>50 000 000 ₽</code>.", reply_markup=main_kb(uid), parse_mode="HTML")
+        return
+    if int(p["money"]) < amount:
+        await safe_answer(message, f"💸 Недостаточно наличных (у вас <b>{p['money']} ₽</b>).", reply_markup=main_kb(uid), parse_mode="HTML")
+        return
+
+    p["money"] = int(p["money"]) - amount
+    fdata["balance"] = int(fdata["balance"]) + amount
+    save_state()
+
+    await safe_answer(
+        message,
+        f"✅ Казна семьи <b>«{esc(fdata['name'])}»</b> пополнена на <b>{esc(format_rub(amount))}</b>!",
+        reply_markup=main_kb(uid),
+        parse_mode="HTML",
+    )
+    await send_or_edit_family_card(message, fid, uid, edit=False)
+
+
+@dp.callback_query(F.data.startswith("fam_mansion:"))
+async def cb_fam_mansion(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
     if not fdata:
         await callback.answer("Семья не найдена", show_alert=True)
         return
-    if int(fdata.get("balance", 0)) < amt:
-        await callback.answer("В общаке недостаточно средств", show_alert=True)
+    if fdata["has_mansion"]:
+        await callback.answer(f"Особняк семьи уже куплен: {fdata['mansion_name']}", show_alert=True)
         return
-    fdata["balance"] = int(fdata.get("balance", 0)) - amt
-    p["money"] += amt
+    if int(fdata["owner_uid"]) != uid:
+        await callback.answer("Купить особняк может только Глава семьи", show_alert=True)
+        return
+    price = 1_500_000
+    if int(fdata["balance"]) < price:
+        await callback.answer(f"В казне нужно {format_rub(price)} для покупки особняка", show_alert=True)
+        return
+    fdata["balance"] = int(fdata["balance"]) - price
+    fdata["has_mansion"] = True
+    fdata["reputation"] = int(fdata["reputation"]) + 50
     save_state()
-    await callback.answer(f"Снято +{amt} ₽ из общака!", show_alert=True)
+    await callback.answer("Куплен общий особняк семьи (+50 репутации)!", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data.startswith("fam_cars:"))
+async def cb_fam_cars(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    if int(fdata["owner_uid"]) != uid:
+        await callback.answer("Покупать авто в автопарк семьи может только Глава", show_alert=True)
+        return
+    if len(fdata["cars"]) >= int(fdata["max_cars"]):
+        await callback.answer("Автопарк семьи заполнен! Сделайте апгрейд.", show_alert=True)
+        return
+    car_key = "vaz_2107" if len(fdata["cars"]) == 0 else "priora"
+    cinfo = SHOP_CARS[car_key]
+    price = int(cinfo["price"])
+    if int(fdata["balance"]) < price:
+        await callback.answer(f"В казне семьи нужно {format_rub(price)} для покупки {cinfo['name']}", show_alert=True)
+        return
+    fdata["balance"] = int(fdata["balance"]) - price
+    fdata["cars"].append(car_key)
+    save_state()
+    await callback.answer(f"В автопарк семьи добавлен {cinfo['name']}!", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data.startswith("fam_armory:"))
+async def cb_fam_armory(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    if int(fdata["owner_uid"]) != uid:
+        await callback.answer("Пополнять арсенал семьи может только Глава", show_alert=True)
+        return
+    winfo = FAMILY_WEAPONS["makarov"]
+    price = int(winfo["price"])
+    if int(fdata["balance"]) < price:
+        await callback.answer(f"В казне семьи нужно {format_rub(price)} для покупки {winfo['name']}", show_alert=True)
+        return
+    fdata["balance"] = int(fdata["balance"]) - price
+    fdata["weapons"].append("makarov")
+    fdata["reputation"] = int(fdata["reputation"]) + int(winfo["rep_bonus"])
+    save_state()
+    await callback.answer(f"В арсенал добавлен: {winfo['name']}!", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data.startswith("fam_contract:"))
+async def cb_fam_contract(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata or uid not in fdata["members"]:
+        await callback.answer("Вы не состоите в этой семье", show_alert=True)
+        return
+    if int(fdata["contracts_done"]) >= FAMILY_DAILY_CONTRACTS_LIMIT:
+        await callback.answer(f"Дневной лимит контрактов ({FAMILY_DAILY_CONTRACTS_LIMIT}/{FAMILY_DAILY_CONTRACTS_LIMIT}) исчерпан", show_alert=True)
+        return
+    fdata["contracts_done"] = int(fdata["contracts_done"]) + 1
+    fdata["tokens"] = int(fdata["tokens"]) + 2
+    fdata["reputation"] = int(fdata["reputation"]) + 15
+    fdata["balance"] = int(fdata["balance"]) + 45000
+    save_state()
+    await callback.answer("Контракт выполнен! +2 жетона, +15 репутации, +45 000 ₽ в казну", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data.startswith("fam_wh:"))
+async def cb_fam_wh(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    await callback.answer(
+        f"Склад семьи: {fdata['warehouse_items']} шт. | Танкер: {fdata['tanker_fuel']} л.",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("fam_shop:"))
+async def cb_fam_shop(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    if int(fdata["owner_uid"]) != uid:
+        await callback.answer("Закупать припасы для семьи может только Глава", show_alert=True)
+        return
+    cost = 50000
+    if int(fdata["balance"]) < cost:
+        await callback.answer(f"В казне нужно {format_rub(cost)} для закупки припасов", show_alert=True)
+        return
+    fdata["balance"] = int(fdata["balance"]) - cost
+    fdata["warehouse_items"] = int(fdata["warehouse_items"]) + 10
+    fdata["tanker_fuel"] = int(fdata["tanker_fuel"]) + 100
+    save_state()
+    await callback.answer("Закуплено +10 припасов на склад и +100 л. топлива в танкер!", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data == "fam_rating")
+async def cb_fam_rating(callback: CallbackQuery):
+    top = []
+    for k, fdata in families.items():
+        if isinstance(fdata, dict):
+            norm = normalize_family(fdata, str(k))
+            top.append((int(norm["reputation"]), int(norm["level"]), str(norm["name"]), str(k)))
+    top.sort(key=lambda x: (-x[0], -x[1]))
+    if not top:
+        await callback.answer("Рейтинг семей пока пуст", show_alert=True)
+        return
+    summary = " | ".join(f"{i+1}. {name} ({rep} реп.)" for i, (rep, _, name, _) in enumerate(top[:5]))
+    await callback.answer(f"Топ семей: {summary}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("fam_tanker:"))
+async def cb_fam_tanker(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    if int(fdata["tanker_fuel"]) < 20:
+        await callback.answer("В танкере недостаточно топлива (нужно минимум 20 л.)", show_alert=True)
+        return
+    fdata["tanker_fuel"] = int(fdata["tanker_fuel"]) - 20
+    fdata["reputation"] = int(fdata["reputation"]) + 5
+    save_state()
+    await callback.answer("Выдан топливный бонус автопарку (-20 л., +5 репутации)", show_alert=True)
+    if callback.message:
+        await send_or_edit_family_card(callback.message, fid, uid, edit=True)
+
+
+@dp.callback_query(F.data.startswith("fam_ranks:"))
+async def cb_fam_ranks(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    rk_summary = ", ".join(
+        f"{(users.get(str(m), {}) or {}).get('name', f'#{m}')}: {get_family_member_rank(fdata, m)}"
+        for m in fdata["members"][:6]
+    )
+    await callback.answer(f"Ранги: {rk_summary}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("fam_roster:"))
+async def cb_fam_roster(callback: CallbackQuery):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata:
+        await callback.answer("Семья не найдена", show_alert=True)
+        return
+    names = [
+        f"{(users.get(str(m), {}) or {}).get('name', f'#{m}')} ({get_family_member_rank(fdata, m)})"
+        for m in fdata["members"][:8]
+    ]
+    await callback.answer(f"Состав ({len(fdata['members'])}/{fdata['max_members']}): " + ", ".join(names), show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("fam_rename_ask:"))
+async def cb_fam_rename_ask(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) != uid:
+        await callback.answer("Переименовывать семью может только Глава", show_alert=True)
+        return
+    await state.update_data(fam_target_id=fid)
+    await state.set_state(FamilyStates.renaming_family)
+    await callback.answer()
+    if callback.message:
+        await safe_answer(callback.message, "✏️ Введите новое название семьи (до 32 символов) или <code>/cancel</code>:", parse_mode="HTML")
+
+
+@dp.message(FamilyStates.renaming_family)
+async def process_fam_rename(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    new_name = (message.text or "").strip()[:32]
+    data = await state.get_data()
+    fid = str(data.get("fam_target_id") or "")
+    await state.clear()
+
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) != uid:
+        await safe_answer(message, "❌ Недостаточно прав.", reply_markup=main_kb(uid))
+        return
+    if len(new_name) < 2:
+        await safe_answer(message, "⚠️ Название слишком короткое.", reply_markup=main_kb(uid))
+        return
+
+    fdata["name"] = new_name
+    save_state()
+    await safe_answer(message, f"✅ Семья переименована в <b>«{esc(new_name)}»</b>!", reply_markup=main_kb(uid), parse_mode="HTML")
+    await send_or_edit_family_card(message, fid, uid, edit=False)
 
 
 @dp.callback_query(F.data.startswith("fam_leave:"))
@@ -4419,145 +5362,89 @@ async def cb_fam_leave(callback: CallbackQuery):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
     fid = callback.data.split(":", 1)[1]
-    fdata = families.get(fid)
-    if fdata:
-        members = list(fdata.get("members") or [])
-        if uid in members:
-            members.remove(uid)
-            fdata["members"] = members
-        if fdata.get("owner_uid") == uid:
-            if members:
-                fdata["owner_uid"] = members[0]
-                next_u = users.get(str(members[0]))
-                fdata["owner_name"] = next_u.get("name") if isinstance(next_u, dict) else "Глава"
-            else:
-                del families[fid]
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) == uid:
+        await callback.answer("Глава не может просто покинуть семью — используйте «Распустить семью»", show_alert=True)
+        return
+    if uid in fdata["members"]:
+        fdata["members"].remove(uid)
     p["family_id"] = None
     save_state()
-    await callback.answer("Вы вышли из семьи", show_alert=True)
+    await callback.answer("Вы покинули семью", show_alert=True)
+    if callback.message:
+        await safe_answer(callback.message, "🚪 Вы вышли из семьи.", reply_markup=main_kb(uid))
 
 
-def build_member_faction_kb(uid: int, p: dict[str, Any], cur_fac: str) -> InlineKeyboardMarkup:
-    fdata = FACTIONS[cur_fac]
-    rk = int(p.get("rank", 1))
-    pending_apps = sum(
-        1 for a in faction_apps.values()
-        if isinstance(a, dict) and a.get("faction") == cur_fac and a.get("status") == "pending"
-    )
-    rows = [
-        [
-            InlineKeyboardButton(text="📋 Задания по времени", callback_data=f"fac_tasks:{cur_fac}"),
-            InlineKeyboardButton(text="💰 Получить зарплату", callback_data=f"fac_salary:{cur_fac}"),
-        ],
-        [
-            InlineKeyboardButton(text="📦 Пополнить склад (+50 мат.)", callback_data=f"fac_mats:{cur_fac}"),
-            InlineKeyboardButton(text="⚔️ Рейд / Спецоперация", callback_data=f"fac_raid:{cur_fac}"),
-        ],
-        [
-            InlineKeyboardButton(text="👥 Состав фракции", callback_data=f"fac_roster:{cur_fac}"),
-            InlineKeyboardButton(text="🏆 Рейтинг фракций", callback_data="fac_top"),
-        ],
-    ]
-    if rk >= 10 or p.get("leader_of") == cur_fac or is_admin(uid, 7):
-        rows.append([
-            InlineKeyboardButton(text=f"📋 Заявки ({pending_apps})", callback_data=f"fac_apps:{cur_fac}"),
-            InlineKeyboardButton(text="💸 Премия составу (10 000 ₽)", callback_data=f"fac_bonus:{cur_fac}"),
-        ])
-    rows.append([
-        InlineKeyboardButton(text="🚪 Уволиться ПСЖ", callback_data="fac_leave_self"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+@dp.callback_query(F.data.startswith("fam_disband:"))
+async def cb_fam_disband(callback: CallbackQuery):
+    uid = callback.from_user.id
+    p = get_player(uid, callback.from_user.full_name)
+    fid = callback.data.split(":", 1)[1]
+    fdata = get_family_by_id(fid)
+    if not fdata or int(fdata["owner_uid"]) != uid:
+        await callback.answer("Распустить семью может только Глава", show_alert=True)
+        return
+    for m_uid in list(fdata.get("members") or []):
+        m_u = users.get(str(m_uid))
+        if isinstance(m_u, dict):
+            m_u["family_id"] = None
+    p["family_id"] = None
+    families.pop(fid, None)
+    save_state()
+    await callback.answer("Семья распущена", show_alert=True)
+    if callback.message:
+        await safe_answer(callback.message, "🗑 Семья распущена.", reply_markup=main_kb(uid))
+
+
+@dp.message(F.text == "🏆 Топ-10")
+async def btn_top10(message: Message):
+    uid = message.from_user.id
+    get_player(uid, message.from_user.full_name)
+    ranked = []
+    for k, u in users.items():
+        if isinstance(u, dict):
+            try:
+                tg_id = int(u.get("tg_id") or k)
+            except ValueError:
+                continue
+            norm = normalize_player(u, tg_id)
+            cap = int(norm.get("money", 0)) + int(norm.get("bank", 0))
+            ranked.append((cap, int(norm.get("lvl", 1)), str(norm.get("name", "Игрок")), int(norm.get("game_id", 0))))
+    ranked.sort(key=lambda item: (-item[0], -item[1]))
+    lines = ["🏆 <b>Топ-10 самых состоятельных жителей области:</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for idx, (cap, lvl, uname, gid) in enumerate(ranked[:10], start=1):
+        prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+        lines.append(f"{prefix} <b>{esc(uname)}</b> (<code>#{gid}</code>) — <b>{cap} ₽</b> (<code>{lvl} ур.</code>)")
+    await safe_answer(message, "\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(F.text == "🏛 Фракции")
 async def btn_factions(message: Message):
     uid = message.from_user.id
     p = get_player(uid, message.from_user.full_name)
-    cur_fac = p.get("faction", "none")
-
-    if cur_fac in FACTIONS:
-        fdata = FACTIONS[cur_fac]
-        fs = get_fstate(cur_fac)
-        rk = int(p.get("rank", 1))
-        rk_title = get_faction_rank_title(cur_fac, rk)
-
-        active_task_line = ""
-        active_task = find_faction_task(cur_fac, p.get("active_ftask_id"))
-        if active_task:
-            rem = float(p.get("active_ftask_ends_at", 0.0) or 0.0) - time.time()
-            if rem > 0:
-                active_task_line = f"\n⏳ В процессе: <b>{esc(active_task['title'])}</b> — осталось <b>{esc(format_duration(rem))}</b>"
-            else:
-                active_task_line = f"\n✅ Готово к сдаче: <b>{esc(active_task['title'])}</b> (откройте «📋 Задания по времени»)"
-
-        text = (
-            f"🏛 <b>Фракция: {esc(fdata['name'])}</b>\n"
-            f"🎖 Ваша должность: <b>{esc(rk_title)}</b> (<code>{rk}/13</code> ранг) | Выговоров: <code>{p.get('f_warns', 0)}/3</code>\n"
-            f"⭐ Очки службы: <b><code>{p['faction_points']}</code></b> | Базовый оклад: <code>{fdata['salary']} ₽</code>\n"
-            f"🏦 Казна фракции: <b>{fs['treasury']} ₽</b> | 📦 Склад материалов: <b><code>{fs['materials']}</code> ед.</b>\n"
-            f"🔥 Рейтинг влияния: <b><code>{fs['rating']}</code></b>{active_task_line}\n\n"
-            f"Команды: <code>/r &lt;текст&gt;</code>, <code>/d &lt;текст&gt;</code>, <code>/fdeposit &lt;сумма&gt;</code>, <code>/members</code>, <code>/fapps</code>, <code>/fwarn &lt;ID&gt; [причина]</code>"
-        )
-        await safe_answer(message, text, reply_markup=build_member_faction_kb(uid, p, cur_fac), parse_mode="HTML")
-        return
-
-    lines = [
-        "🏛 <b>Фракции Criminal Russia RP</b> (вы сейчас <b>Гражданский</b>)\n"
-        "Выберите организацию для подачи заявки или подработки у NPC:\n"
-    ]
-    rows = []
+    cur_f = p.get("faction", "none")
+    cur_line = (
+        f"Ваша фракция: <b>{esc(FACTIONS[cur_f]['name'])}</b> — <b>{esc(get_faction_rank_title(cur_f, int(p['rank'])))}</b> (<code>{p['rank']}/13</code>)\n"
+        if cur_f in FACTIONS
+        else "Вы сейчас гражданский.\n"
+    )
+    lines = [f"🏛 <b>Государственные и криминальные фракции:</b>\n{cur_line}"]
+    rows: list[list[InlineKeyboardButton]] = []
     for fid, fdata in FACTIONS.items():
         fs = get_fstate(fid)
         lines.append(
-            f"• <b>{esc(fdata['name'])}</b> (<code>{esc(fid)}</code>) — от <code>{fdata['min_lvl']}</code> ур., оклад <code>{fdata['salary']} ₽</code>, "
-            f"рейтинг <code>{fs['rating']}</code>, NPC: <i>{esc(fdata['npc'])}</i>"
+            f"• <b>{esc(fdata['name'])}</b> (<code>{fid}</code>) — оклад <code>{fdata['salary']} ₽</code>, мин. ур. <code>{fdata['min_lvl']}</code>, казна <code>{fs['treasury']} ₽</code>"
         )
-        rows.append([
-            InlineKeyboardButton(text=f"📝 Вступить в {fdata['name']}", callback_data=f"fac_apply:{fid}"),
-            InlineKeyboardButton(text=f"🤖 Задание ({fid})", callback_data=f"fac_npc:{fid}"),
-        ])
-    rows.append([InlineKeyboardButton(text="🏆 Рейтинг всех фракций", callback_data="fac_top")])
+        rows.append([InlineKeyboardButton(text=f"📝 Подать заявку в {fdata['name']}", callback_data=f"fapp:{fid}")])
+    if cur_f in FACTIONS:
+        rows.append([InlineKeyboardButton(text="📋 Задания фракции", callback_data=f"ftasks:{cur_f}")])
+        rows.append([InlineKeyboardButton(text="🚪 Покинуть фракцию", callback_data="fleave")])
     await safe_answer(message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
 
-@dp.callback_query(F.data == "fac_top")
-async def cb_fac_top(callback: CallbackQuery):
-    ranking = []
-    for fid, fdata in FACTIONS.items():
-        fs = get_fstate(fid)
-        cnt = sum(1 for u in users.values() if isinstance(u, dict) and u.get("faction") == fid)
-        ranking.append((int(fs.get("rating", 0)), int(fs.get("treasury", 0)), cnt, fdata["name"]))
-    ranking.sort(key=lambda x: (-x[0], -x[1]))
-    lines = ["🏆 <b>Рейтинг влияния фракций:</b>\n"]
-    for i, (rt, tr, cnt, fname) in enumerate(ranking, start=1):
-        lines.append(f"{i}. <b>{esc(fname)}</b> — 🔥 <code>{rt}</code> очков | 🏦 <code>{tr} ₽</code> | 👥 <code>{cnt}</code> чел.")
-    if callback.message:
-        await safe_answer(callback.message, "\n".join(lines), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("fac_roster:"))
-async def cb_fac_roster(callback: CallbackQuery):
-    fid = callback.data.split(":", 1)[1]
-    if fid not in FACTIONS:
-        await callback.answer("Фракция не найдена", show_alert=True)
-        return
-    roster = []
-    for k, u in users.items():
-        if isinstance(u, dict) and u.get("faction") == fid:
-            r_val = 13 if u.get("leader_of") == fid else int(u.get("rank", 1))
-            roster.append((r_val, str(u.get("name", "Игрок")), int(u.get("game_id", 0))))
-    roster.sort(key=lambda x: (-x[0], x[1].lower()))
-    lines = [f"👥 <b>Состав «{esc(FACTIONS[fid]['name'])}»</b> (<code>{len(roster)}</code>):\n"]
-    for idx, (rv, nm, gid) in enumerate(roster[:25], start=1):
-        lines.append(f"{idx}. <b>{esc(nm)}</b> (<code>#{gid}</code>) — {esc(get_faction_rank_title(fid, rv))} (<code>{rv}/13</code>)")
-    if callback.message:
-        await safe_answer(callback.message, "\n".join(lines), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("fac_apply:"))
-async def cb_fac_apply(callback: CallbackQuery, bot: Bot):
+@dp.callback_query(F.data.startswith("fapp:"))
+async def cb_faction_apply(callback: CallbackQuery):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
     fid = callback.data.split(":", 1)[1]
@@ -4565,114 +5452,44 @@ async def cb_fac_apply(callback: CallbackQuery, bot: Bot):
     if not fdata:
         await callback.answer("Фракция не найдена", show_alert=True)
         return
-    if p.get("faction") == fid:
-        await callback.answer("Вы уже состоите в этой фракции", show_alert=True)
+    if p.get("faction", "none") != "none":
+        await callback.answer("Вы уже состоите во фракции", show_alert=True)
         return
-    if int(p.get("lvl", 1)) < int(fdata.get("min_lvl", 1)):
-        await callback.answer(f"Для вступления нужен {fdata['min_lvl']} уровень!", show_alert=True)
+    if int(p["lvl"]) < int(fdata["min_lvl"]):
+        await callback.answer(f"Нужен минимум {fdata['min_lvl']} уровень", show_alert=True)
         return
-    if fdata.get("type") == "law" and int(p.get("wanted", 0)) > 0:
-        await callback.answer("Нельзя вступить в госструктуру с активным розыском!", show_alert=True)
-        return
-
     app_id = f"{uid}_{fid}"
     faction_apps[app_id] = {
         "id": app_id,
-        "uid": uid,
+        "user_id": uid,
         "game_id": p["game_id"],
         "name": p["name"],
         "faction": fid,
         "status": "pending",
-        "created_at": int(time.time()),
     }
     save_state()
-
-    for k, u in users.items():
-        if isinstance(u, dict) and u.get("faction") == fid:
-            if u.get("leader_of") == fid or int(u.get("rank", 1)) >= 10:
-                await safe_send(
-                    bot,
-                    int(k),
-                    f"📩 Новая заявка в <b>{esc(fdata['name'])}</b> от <b>{esc(p['name'])}</b> (<code>#{p['game_id']}</code>, {p['lvl']} ур.)!\n"
-                    f"Принять: <code>/faccept {p['game_id']}</code> | Отклонить: <code>/fdecline {p['game_id']}</code>",
-                    parse_mode="HTML",
-                )
-
-    await callback.answer(f"Заявка в «{fdata['name']}» отправлена старшему составу!", show_alert=True)
+    await callback.answer(f"Заявка в «{fdata['name']}» отправлена!", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("fac_apps:"))
-async def cb_fac_apps(callback: CallbackQuery):
+@dp.callback_query(F.data == "fleave")
+async def cb_faction_leave(callback: CallbackQuery):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if not (p.get("faction") == fid and (p.get("leader_of") == fid or int(p.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await callback.answer("Недостаточно прав для просмотра заявок", show_alert=True)
+    if p.get("faction", "none") == "none":
+        await callback.answer("Вы не во фракции", show_alert=True)
         return
-    pending = [a for a in faction_apps.values() if isinstance(a, dict) and a.get("faction") == fid and a.get("status") == "pending"]
-    if not pending:
-        await callback.answer("Активных заявок нет", show_alert=True)
-        return
-    lines = [f"📋 <b>Заявки в «{esc(FACTIONS[fid]['name'])}»</b> (<code>{len(pending)}</code>):\n"]
-    rows = []
-    for a in pending[:10]:
-        gid = a["game_id"]
-        lines.append(f"• <b>{esc(a['name'])}</b> (<code>#{gid}</code>)")
-        rows.append([
-            InlineKeyboardButton(text=f"✅ Принять #{gid}", callback_data=f"fapp_ok:{fid}:{gid}"),
-            InlineKeyboardButton(text=f"❌ Отклонить #{gid}", callback_data=f"fapp_no:{fid}:{gid}"),
-        ])
-    if callback.message:
-        await safe_answer(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("fapp_ok:"))
-async def cb_fapp_ok(callback: CallbackQuery, bot: Bot):
-    uid = callback.from_user.id
-    actor = get_player(uid, callback.from_user.full_name)
-    _, fid, gid_s = callback.data.split(":", 2)
-    gid = int(gid_s)
-    if not (actor.get("faction") == fid and (actor.get("leader_of") == fid or int(actor.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    target = find_player_by_game_id(gid)
-    if not target:
-        await callback.answer("Игрок не найден", show_alert=True)
-        return
-    target["faction"] = fid
-    target["rank"] = 1
-    target["f_warns"] = 0
-    target["faction_points"] = 0
-    app_id = f"{target['tg_id']}_{fid}"
-    if app_id in faction_apps:
-        faction_apps[app_id]["status"] = "accepted"
+    p["faction"] = "none"
+    p["rank"] = 1
+    p["f_warns"] = 0
+    p["leader_of"] = None
+    p["active_ftask_id"] = None
+    p["active_ftask_ends_at"] = 0.0
     save_state()
-    await callback.answer(f"Игрок #{gid} принят!", show_alert=True)
-    await safe_send(bot, int(target["tg_id"]), f"🎉 Ваша заявка одобрена! Вы приняты в <b>{esc(FACTIONS[fid]['name'])}</b> на 1 ранг.", parse_mode="HTML")
+    await callback.answer("Вы покинули фракцию", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("fapp_no:"))
-async def cb_fapp_no(callback: CallbackQuery, bot: Bot):
-    uid = callback.from_user.id
-    actor = get_player(uid, callback.from_user.full_name)
-    _, fid, gid_s = callback.data.split(":", 2)
-    gid = int(gid_s)
-    if not (actor.get("faction") == fid and (actor.get("leader_of") == fid or int(actor.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    target = find_player_by_game_id(gid)
-    if target:
-        app_id = f"{target['tg_id']}_{fid}"
-        if app_id in faction_apps:
-            faction_apps[app_id]["status"] = "declined"
-        save_state()
-        await safe_send(bot, int(target["tg_id"]), f"❌ Ваша заявка в <b>{esc(FACTIONS[fid]['name'])}</b> отклонена.", parse_mode="HTML")
-    await callback.answer(f"Заявка #{gid} отклонена", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("fac_tasks:"))
-async def cb_fac_tasks(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("ftasks:"))
+async def cb_ftasks(callback: CallbackQuery):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
     fid = callback.data.split(":", 1)[1]
@@ -4680,67 +5497,57 @@ async def cb_fac_tasks(callback: CallbackQuery):
         await callback.answer("Вы не состоите в этой фракции", show_alert=True)
         return
 
-    fdata = FACTIONS[fid]
-    tasks = get_faction_tasks(fid)
     now = time.time()
-    active_task = find_faction_task(fid, p.get("active_ftask_id"))
-
-    if active_task:
-        rem = float(p.get("active_ftask_ends_at", 0.0) or 0.0) - now
-        if rem > 0:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить таймер", callback_data=f"fac_tasks:{fid}")],
-                [InlineKeyboardButton(text="❌ Отменить задание", callback_data=f"ftask_cancel:{fid}")],
-                [InlineKeyboardButton(text="⬅️ Назад во фракцию", callback_data=f"fac_back:{fid}")],
-            ])
-            txt = (
-                f"⏳ <b>Задание в процессе — «{esc(fdata['name'])}»</b>\n"
-                f"Задача: <b>{esc(active_task['title'])}</b>\n"
-                f"До завершения осталось: <b>{esc(format_duration(rem))}</b>\n"
-                f"Награда после завершения: <b>+{active_task['reward_money']} ₽</b>, <b>+{active_task['reward_xp']} XP</b>, <code>+{active_task['points']}</code> очков."
+    active_id = p.get("active_ftask_id")
+    ends_at = float(p.get("active_ftask_ends_at", 0.0) or 0.0)
+    if active_id:
+        task_obj = find_faction_task(fid, active_id)
+        if task_obj and now < ends_at:
+            await callback.answer(
+                f"Выполняется задание «{task_obj['title']}». Осталось {format_duration(ends_at - now)}",
+                show_alert=True,
             )
-        else:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Забрать награду", callback_data=f"ftask_claim:{fid}")],
-                [InlineKeyboardButton(text="⬅️ Назад во фракцию", callback_data=f"fac_back:{fid}")],
-            ])
-            txt = (
-                f"✅ <b>Задание готово — «{esc(fdata['name'])}»</b>\n"
-                f"Задача: <b>{esc(active_task['title'])}</b>\n"
-                f"Время вышло! Нажмите <b>«✅ Забрать награду»</b>."
+            return
+        if task_obj and now >= ends_at:
+            rew_money = int(task_obj["reward_money"])
+            rew_xp = int(task_obj["reward_xp"])
+            rew_pts = int(task_obj["points"])
+            t_cut = int(task_obj.get("treasury_cut", 0))
+            p["money"] += rew_money
+            p["xp"] += rew_xp
+            p["faction_points"] = int(p.get("faction_points", 0)) + rew_pts
+            p["active_ftask_id"] = None
+            p["active_ftask_ends_at"] = 0.0
+            while p["xp"] >= p["lvl"] * 100:
+                p["xp"] -= p["lvl"] * 100
+                p["lvl"] += 1
+            fs = get_fstate(fid)
+            fs["treasury"] = int(fs.get("treasury", 0)) + t_cut
+            fs["rating"] = int(fs.get("rating", 0)) + rew_pts
+            save_state()
+            await callback.answer(
+                f"Задание выполнено! +{rew_money} ₽, +{rew_xp} XP, +{rew_pts} очков фракции",
+                show_alert=True,
             )
-        if callback.message:
-            try:
-                await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
-            except Exception:
-                await safe_answer(callback.message, txt, reply_markup=kb, parse_mode="HTML")
-        await callback.answer()
-        return
+            return
 
-    lines = [
-        f"📋 <b>Задания фракции «{esc(fdata['name'])}»</b>\n"
-        f"<i>Задания выполняются по таймеру — награда выдаётся после истечения времени.</i>\n"
-    ]
-    rows: list[list[InlineKeyboardButton]] = []
-    for t in tasks:
-        dur_txt = format_duration(float(t["duration_sec"]))
-        lines.append(
-            f"• <b>{esc(t['title'])}</b> — ⏱ <b>{esc(dur_txt)}</b> | "
-            f"награда: <b>+{t['reward_money']} ₽</b>, <code>+{t['reward_xp']} XP</code>, <code>+{t['points']}</code> очк."
-        )
-        rows.append([
+    tasks = get_faction_tasks(fid)
+    rows = [
+        [
             InlineKeyboardButton(
-                text=f"▶️ Начать ({dur_txt}): {t['title'][:28]}",
+                text=f"▶️ {t['title'][:28]} ({t['duration_sec'] // 60}м)",
                 callback_data=f"ftask_start:{fid}:{t['id']}",
             )
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад во фракцию", callback_data=f"fac_back:{fid}")])
-
+        ]
+        for t in tasks
+    ]
     if callback.message:
-        try:
-            await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
-        except Exception:
-            await safe_answer(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+        await callback.message.answer(
+            f"📋 <b>Задания фракции «{esc(FACTIONS[fid]['name'])}»</b>\n"
+            f"Ваши очки фракции: <b><code>{p.get('faction_points', 0)}</code></b> | Силы: <code>{p['stamina']}/100</code> | Голод: <code>{p['hunger']}/100</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
@@ -4748,380 +5555,101 @@ async def cb_fac_tasks(callback: CallbackQuery):
 async def cb_ftask_start(callback: CallbackQuery):
     uid = callback.from_user.id
     p = get_player(uid, callback.from_user.full_name)
-    _, fid, task_id = callback.data.split(":", 2)
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
+    _, fid, tid = callback.data.split(":", 2)
+    if p.get("faction") != fid:
+        await callback.answer("Вы не в этой фракции", show_alert=True)
         return
-    if p.get("active_ftask_id"):
-        await callback.answer("У вас уже есть активное задание!", show_alert=True)
-        return
-
-    task = find_faction_task(fid, task_id)
-    if not task:
+    task_obj = find_faction_task(fid, tid)
+    if not task_obj:
         await callback.answer("Задание не найдено", show_alert=True)
         return
-
-    req_stamina = int(task.get("stamina", 15))
-    req_hunger = int(task.get("hunger", 10))
-    if int(p.get("stamina", 100)) < req_stamina or int(p.get("hunger", 100)) < req_hunger:
-        await callback.answer(
-            f"Нужно минимум {req_stamina} выносливости и {req_hunger} голода!",
-            show_alert=True,
-        )
+    st_cost = int(task_obj.get("stamina", 15))
+    hg_cost = int(task_obj.get("hunger", 10))
+    if int(p["stamina"]) < st_cost:
+        await callback.answer(f"Нужно минимум {st_cost} выносливости", show_alert=True)
+        return
+    if int(p["hunger"]) < hg_cost:
+        await callback.answer(f"Нужно минимум {hg_cost} сытости", show_alert=True)
         return
 
-    dur_sec = int(task["duration_sec"])
-    p["active_ftask_id"] = task["id"]
-    p["active_ftask_ends_at"] = time.time() + dur_sec
-    p["stamina"] = clamp_stat(int(p.get("stamina", 100)) - req_stamina)
-    p["hunger"] = clamp_stat(int(p.get("hunger", 100)) - req_hunger)
+    dur = int(task_obj["duration_sec"])
+    p["stamina"] = clamp_stat(int(p["stamina"]) - st_cost)
+    p["hunger"] = clamp_stat(int(p["hunger"]) - hg_cost)
+    p["active_ftask_id"] = tid
+    p["active_ftask_ends_at"] = time.time() + dur
     save_state()
-
-    await callback.answer(f"Задание начато! Время: {format_duration(dur_sec)}", show_alert=True)
-    if callback.message:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Проверить готовность", callback_data=f"fac_tasks:{fid}")],
-            [InlineKeyboardButton(text="❌ Отменить задание", callback_data=f"ftask_cancel:{fid}")],
-            [InlineKeyboardButton(text="⬅️ Назад во фракцию", callback_data=f"fac_back:{fid}")],
-        ])
-        txt = (
-            f"⏱ <b>Задание начато — «{esc(FACTIONS[fid]['name'])}»</b>\n"
-            f"Задача: <b>{esc(task['title'])}</b>\n"
-            f"Длительность: <b>{esc(format_duration(dur_sec))}</b>.\n"
-            f"Когда время выйдет, откройте задание и нажмите «Забрать награду»."
-        )
-        try:
-            await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
+    await callback.answer(f"Задание начато! Длительность: {format_duration(dur)}", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("ftask_claim:"))
-async def cb_ftask_claim(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
-        return
-
-    task = find_faction_task(fid, p.get("active_ftask_id"))
-    if not task:
-        await callback.answer("Активного задания нет", show_alert=True)
-        return
-
-    rem = float(p.get("active_ftask_ends_at", 0.0) or 0.0) - time.time()
-    if rem > 0 and not is_creator(uid):
-        await callback.answer(f"Ещё не готово! Осталось: {format_duration(rem)}", show_alert=True)
-        return
-
-    fs = get_fstate(fid)
-    rk = int(p.get("rank", 1))
-    pay = int(task["reward_money"]) + int(rk * 120)
-    xp_rew = int(task["reward_xp"])
-    pts = int(task["points"])
-    treasury_cut = int(task.get("treasury_cut", 500))
-
-    p["money"] += pay
-    p["xp"] += xp_rew
-    p["faction_points"] = int(p.get("faction_points", 0)) + pts
-    p["active_ftask_id"] = None
-    p["active_ftask_ends_at"] = 0.0
-    p["last_fmission"] = time.time()
-
-    while p["xp"] >= p["lvl"] * 100:
-        p["xp"] -= p["lvl"] * 100
-        p["lvl"] += 1
-
-    promo_txt = ""
-    if rk < 9 and p["faction_points"] >= rk * 100:
-        p["rank"] = rk + 1
-        promo_txt = f"\n🎉 Повышение должности: <b>{esc(get_faction_rank_title(fid, rk + 1))}</b>!"
-
-    fs["treasury"] = int(fs.get("treasury", 0)) + treasury_cut
-    fs["rating"] = int(fs.get("rating", 0)) + 6
-    save_state()
-
-    await callback.answer(f"Награда получена: +{pay} ₽, +{pts} очков!", show_alert=True)
-    if callback.message:
-        txt = (
-            f"✅ <b>Задание выполнено: {esc(task['title'])}</b>\n"
-            f"Награда: <b>+{pay} ₽</b>, <b>+{xp_rew} XP</b>, <code>+{pts}</code> очков службы.\n"
-            f"В казну фракции перечислено: <b>+{treasury_cut} ₽</b>.{promo_txt}"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Новые задания", callback_data=f"fac_tasks:{fid}")],
-            [InlineKeyboardButton(text="⬅️ Назад во фракцию", callback_data=f"fac_back:{fid}")],
-        ])
-        try:
-            await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
-
-
-@dp.callback_query(F.data.startswith("ftask_cancel:"))
-async def cb_ftask_cancel(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    p["active_ftask_id"] = None
-    p["active_ftask_ends_at"] = 0.0
-    save_state()
-    await callback.answer("Задание отменено", show_alert=True)
-    if fid in FACTIONS and callback.message:
-        await cb_fac_tasks(callback)
-
-
-@dp.callback_query(F.data.startswith("fac_back:"))
-async def cb_fac_back(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    cur_fac = p.get("faction", "none")
-    if cur_fac not in FACTIONS or not callback.message:
-        await callback.answer()
-        return
-    fdata = FACTIONS[cur_fac]
-    fs = get_fstate(cur_fac)
-    rk = int(p.get("rank", 1))
-    rk_title = get_faction_rank_title(cur_fac, rk)
-    text = (
-        f"🏛 <b>Фракция: {esc(fdata['name'])}</b>\n"
-        f"🎖 Ваша должность: <b>{esc(rk_title)}</b> (<code>{rk}/13</code> ранг) | Выговоров: <code>{p.get('f_warns', 0)}/3</code>\n"
-        f"⭐ Очки службы: <b><code>{p['faction_points']}</code></b> | Базовый оклад: <code>{fdata['salary']} ₽</code>\n"
-        f"🏦 Казна фракции: <b>{fs['treasury']} ₽</b> | 📦 Склад материалов: <b><code>{fs['materials']}</code> ед.</b>\n"
-        f"🔥 Рейтинг влияния: <b><code>{fs['rating']}</code></b>\n\n"
-        f"Команды: <code>/r &lt;текст&gt;</code>, <code>/d &lt;текст&gt;</code>, <code>/fdeposit &lt;сумма&gt;</code>, <code>/members</code>, <code>/fapps</code>, <code>/fwarn &lt;ID&gt; [причина]</code>"
-    )
-    try:
-        await callback.message.edit_text(text, reply_markup=build_member_faction_kb(uid, p, cur_fac), parse_mode="HTML")
-    except Exception:
-        await safe_answer(callback.message, text, reply_markup=build_member_faction_kb(uid, p, cur_fac), parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("fac_mission:"))
-async def cb_fac_mission(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
-        return
-    if int(p.get("stamina", 100)) < 15 or int(p.get("hunger", 100)) < 10:
-        await callback.answer("Нужно минимум 15 выносливости и 10 голода для задания!", show_alert=True)
-        return
-    now = time.time()
-    left = int(45 - (now - float(p.get("last_fmission", 0.0))))
-    if left > 0:
-        await callback.answer(f"Подождите {left} сек. до следующего задания фракции", show_alert=True)
-        return
-
-    fdata = FACTIONS[fid]
-    fs = get_fstate(fid)
-    rk = int(p.get("rank", 1))
-    pay = int(fdata["salary"] * (1 + rk * 0.12)) + random.randint(400, 1100)
-    pts = random.randint(15, 30)
-    treasury_cut = int(pay * 0.25)
-
-    p["money"] += pay
-    p["xp"] += 35
-    p["stamina"] = clamp_stat(int(p["stamina"]) - 15)
-    p["hunger"] = clamp_stat(int(p["hunger"]) - 10)
-    p["faction_points"] = int(p.get("faction_points", 0)) + pts
-    p["last_fmission"] = now
-    while p["xp"] >= p["lvl"] * 100:
-        p["xp"] -= p["lvl"] * 100
-        p["lvl"] += 1
-
-    promo_txt = ""
-    if rk < 9 and p["faction_points"] >= rk * 100:
-        p["rank"] = rk + 1
-        promo_txt = f" | Повышение: {get_faction_rank_title(fid, rk + 1)}!"
-
-    fs["treasury"] = int(fs.get("treasury", 0)) + treasury_cut
-    fs["rating"] = int(fs.get("rating", 0)) + 5
-    save_state()
-    await callback.answer(
-        f"{fdata['mission_name']}: +{pay} ₽, +{pts} очков службы (+{treasury_cut} ₽ в казну){promo_txt}",
-        show_alert=True,
-    )
-
-
-@dp.callback_query(F.data.startswith("fac_salary:"))
-async def cb_fac_salary(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
-        return
-    fs = get_fstate(fid)
-    sal = int(FACTIONS[fid]["salary"] * (1 + (int(p["rank"]) - 1) * 0.1))
-    if int(fs.get("treasury", 0)) < sal:
-        await callback.answer("В казне фракции недостаточно средств для выплаты оклада!", show_alert=True)
-        return
-    now = time.time()
-    left = int(120 - (now - float(p.get("last_npc", 0.0))))
-    if left > 0:
-        await callback.answer(f"Следующая зарплата из казны через {left} сек.", show_alert=True)
-        return
-    fs["treasury"] -= sal
-    p["money"] += sal
-    p["last_npc"] = now
-    save_state()
-    await callback.answer(f"Выплачен оклад из казны: +{sal} ₽!", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("fac_mats:"))
-async def cb_fac_mats(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
-        return
-    fs = get_fstate(fid)
-    cost = 1500
-    if int(fs.get("treasury", 0)) < cost:
-        await callback.answer("В казне не хватает 1 500 ₽ на закупку материалов", show_alert=True)
-        return
-    fs["treasury"] -= cost
-    fs["materials"] = int(fs.get("materials", 0)) + 50
-    p["faction_points"] = int(p.get("faction_points", 0)) + 10
-    save_state()
-    await callback.answer("На склад доставлено +50 материалов (+10 очков службы)!", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("fac_raid:"))
-async def cb_fac_raid(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if p.get("faction") != fid or fid not in FACTIONS:
-        await callback.answer("Вы не состоите в этой фракции", show_alert=True)
-        return
-    if int(p.get("stamina", 100)) < 25:
-        await callback.answer("Для рейда нужно минимум 25 выносливости!", show_alert=True)
-        return
-    fs = get_fstate(fid)
-    if int(fs.get("materials", 0)) < 100:
-        await callback.answer("Для рейда нужно минимум 100 ед. материалов на складе!", show_alert=True)
-        return
-    now = time.time()
-    left = int(180 - (now - float(fs.get("last_raid", 0.0))))
-    if left > 0:
-        await callback.answer(f"Фракция готовится к следующему рейду (осталось {left} сек.)", show_alert=True)
-        return
-
-    fs["materials"] -= 100
-    fs["last_raid"] = now
-    p["stamina"] = clamp_stat(int(p["stamina"]) - 25)
-    p["hunger"] = clamp_stat(int(p["hunger"]) - 15)
-    win = random.random() < 0.65
-    if win:
-        loot = random.randint(4000, 9000)
-        fs["treasury"] = int(fs.get("treasury", 0)) + loot
-        fs["rating"] = int(fs.get("rating", 0)) + 25
-        p["faction_points"] = int(p.get("faction_points", 0)) + 35
-        p["money"] += 1500
-        save_state()
-        await callback.answer(f"Успешный рейд! В казну +{loot} ₽, рейтинг +25, вам +1 500 ₽ и +35 очков!", show_alert=True)
-    else:
-        fs["rating"] = max(0, int(fs.get("rating", 0)) - 10)
-        p["hp"] = clamp_stat(int(p["hp"]) - 15)
-        save_state()
-        await callback.answer("Рейд сорвался: рейтинг -10, вы получили ушибы (-15 HP).", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("fac_bonus:"))
-async def cb_fac_bonus(callback: CallbackQuery, bot: Bot):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    if not (p.get("faction") == fid and (p.get("leader_of") == fid or int(p.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await callback.answer("Премии могут выдавать руководители фракции (10+ ранг) или админы 7+ ур.", show_alert=True)
-        return
-    fs = get_fstate(fid)
-    bonus_each = 10000
-    members = [(k, u) for k, u in users.items() if isinstance(u, dict) and u.get("faction") == fid]
-    if not members:
-        await callback.answer("Нет сотрудников для премии", show_alert=True)
-        return
-    total_cost = bonus_each * len(members)
-    if int(fs.get("treasury", 0)) < total_cost:
-        await callback.answer(f"В казне нужно {total_cost} ₽ (сейчас {fs.get('treasury', 0)} ₽)", show_alert=True)
-        return
-    fs["treasury"] -= total_cost
-    for k, u in members:
-        u["money"] = int(u.get("money", 0)) + bonus_each
-        try:
-            await safe_send(bot, int(k), f"💸 Вам начислена фракционная премия <b>+{bonus_each} ₽</b> от руководства <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
-        except Exception:
-            pass
-    save_state()
-    await callback.answer(f"Выдана премия по {bonus_each} ₽ всем ({len(members)} чел.)!", show_alert=True)
-
-
-@dp.callback_query(F.data == "fac_leave_self")
-async def cb_fac_leave_self(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    if p.get("faction") == "none":
-        await callback.answer("Вы не состоите во фракции", show_alert=True)
-        return
-    p["faction"] = "none"
-    p["rank"] = 1
-    p["f_warns"] = 0
-    p["leader_of"] = None
-    p["faction_points"] = 0
-    p["active_ftask_id"] = None
-    p["active_ftask_ends_at"] = 0.0
-    save_state()
-    await callback.answer("Вы уволились из фракции по собственному желанию.", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("fac_npc:"))
-async def cb_fac_npc(callback: CallbackQuery):
-    uid = callback.from_user.id
-    p = get_player(uid, callback.from_user.full_name)
-    fid = callback.data.split(":", 1)[1]
-    fdata = FACTIONS.get(fid)
-    if not fdata:
-        await callback.answer("Фракция не найдена", show_alert=True)
-        return
-    now = time.time()
-    left = int(40 - (now - float(p.get("last_npc", 0.0))))
-    if left > 0:
-        await callback.answer(f"{fdata['npc']} занят. Подождите {left} сек.", show_alert=True)
-        return
-    reward = random.randint(1200, 2600)
-    p["money"] += reward
-    p["xp"] += 20
-    p["last_npc"] = now
-    while p["xp"] >= p["lvl"] * 100:
-        p["xp"] -= p["lvl"] * 100
-        p["lvl"] += 1
-    save_state()
-    await callback.answer(f"{fdata['npc']} выдал вам +{reward} ₽ и +20 XP за поручение!", show_alert=True)
-
-
-@dp.message(Command("r"))
-async def cmd_faction_chat(message: Message, bot: Bot):
+@dp.message(Command("fapps"))
+async def cmd_fapps(message: Message):
     uid = message.from_user.id
     p = get_player(uid, message.from_user.full_name)
-    fid = p.get("faction", "none")
-    if fid not in FACTIONS:
-        await safe_answer(message, "Вы не состоите во фракции.")
+    fid = p.get("leader_of") or (p.get("faction") if int(p.get("rank", 1)) >= 11 else None)
+    if not fid or fid not in FACTIONS:
+        await safe_answer(message, "⛔ Просматривать заявки во фракцию могут лидеры и заместители (11–13 ранги).")
         return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await safe_answer(message, "Формат: <code>/r &lt;сообщение в рацию фракции&gt;</code>", parse_mode="HTML")
+    pending = [a for a in faction_apps.values() if a.get("faction") == fid and a.get("status") == "pending"]
+    if not pending:
+        await safe_answer(message, f"В фракцию <b>{esc(FACTIONS[fid]['name'])}</b> пока нет открытых заявок.", parse_mode="HTML")
         return
-    rk_title = get_faction_rank_title(fid, int(p.get("rank", 1)))
-    msg_txt = f"📡 <b>[{esc(FACTIONS[fid]['name'])}] {esc(rk_title)} {esc(p['name'])}:</b> {esc(parts[1].strip())}"
-    for k, u in users.items():
-        if isinstance(u, dict) and u.get("faction") == fid:
-            await safe_send(bot, int(k), msg_txt, parse_mode="HTML")
+    lines = [f"📄 <b>Заявки в «{esc(FACTIONS[fid]['name'])}»</b>:\n"]
+    for a in pending[:20]:
+        lines.append(f"• <b>{esc(a['name'])}</b> (игровой ID: <code>#{a['game_id']}</code>) — принять: <code>/faccept {a['game_id']}</code>")
+    await safe_answer(message, "\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("faccept"))
+async def cmd_faccept(message: Message, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    fid = p.get("leader_of") or (p.get("faction") if int(p.get("rank", 1)) >= 11 else None)
+    if not fid or fid not in FACTIONS:
+        await safe_answer(message, "⛔ Принимать во фракцию могут лидеры и заместители (11–13 ранги).")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await safe_answer(message, "Формат: <code>/faccept &lt;игровой_ID&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1])
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    app_id = f"{target['tg_id']}_{fid}"
+    if app_id in faction_apps:
+        faction_apps[app_id]["status"] = "accepted"
+    target["faction"] = fid
+    target["rank"] = 1
+    target["f_warns"] = 0
+    save_state()
+    await safe_answer(message, f"✅ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) принят в «{esc(FACTIONS[fid]['name'])}».", parse_mode="HTML")
+    await safe_send(bot, int(target["tg_id"]), f"🎉 Вы приняты во фракцию <b>«{esc(FACTIONS[fid]['name'])}»</b>!", parse_mode="HTML")
+
+
+@dp.message(Command("fdecline"))
+async def cmd_fdecline(message: Message, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    fid = p.get("leader_of") or (p.get("faction") if int(p.get("rank", 1)) >= 11 else None)
+    if not fid or fid not in FACTIONS:
+        await safe_answer(message, "⛔ Отклонять заявки могут лидеры и заместители (11–13 ранги).")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await safe_answer(message, "Формат: <code>/fdecline &lt;игровой_ID&gt;</code>", parse_mode="HTML")
+        return
+    gid = int(parts[1])
+    target = find_player_by_game_id(gid)
+    if not target:
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
+        return
+    app_id = f"{target['tg_id']}_{fid}"
+    if app_id in faction_apps:
+        faction_apps[app_id]["status"] = "declined"
+    save_state()
+    await safe_answer(message, f"❌ Заявка игрока <b>{esc(target['name'])}</b> (<code>#{gid}</code>) отклонена.", parse_mode="HTML")
+    await safe_send(bot, int(target["tg_id"]), f"❌ Ваша заявка во фракцию <b>«{esc(FACTIONS[fid]['name'])}»</b> отклонена.", parse_mode="HTML")
 
 
 @dp.message(Command("fdeposit"))
@@ -5136,139 +5664,103 @@ async def cmd_fdeposit(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await safe_answer(message, "Формат: <code>/fdeposit &lt;сумма&gt;</code>", parse_mode="HTML")
         return
-    amt = int(parts[1])
-    if amt < 500 or p["money"] < amt:
-        await safe_answer(message, "Минимальный взнос — 500 ₽, и у вас должно хватать наличных.")
+    amount = int(parts[1])
+    if amount < 100 or amount > 5_000_000:
+        await safe_answer(message, "Сумма пополнения казны — от 100 до 5 000 000 ₽.")
         return
-    p["money"] -= amt
+    if p["money"] < amount:
+        await safe_answer(message, "Недостаточно наличных.")
+        return
+    p["money"] -= amount
     fs = get_fstate(fid)
-    fs["treasury"] = int(fs.get("treasury", 0)) + amt
-    p["faction_points"] = int(p.get("faction_points", 0)) + max(5, amt // 1000)
+    fs["treasury"] = int(fs.get("treasury", 0)) + amount
     save_state()
-    await safe_answer(message, f"🏦 Вы внесли <b>{amt} ₽</b> в казну фракции <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
-
-
-@dp.message(Command("fapps"))
-async def cmd_fapps(message: Message):
-    uid = message.from_user.id
-    p = get_player(uid, message.from_user.full_name)
-    fid = p.get("faction", "none")
-    if not (fid in FACTIONS and (p.get("leader_of") == fid or int(p.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await safe_answer(message, "⛔ Команда доступна лидерам / старшему составу (10+ ранг) или админам 7+ ур.")
-        return
-    target_fid = fid if fid in FACTIONS else None
-    pending = [
-        a for a in faction_apps.values()
-        if isinstance(a, dict) and a.get("status") == "pending" and (target_fid is None or a.get("faction") == target_fid)
-    ]
-    if not pending:
-        await safe_answer(message, "Заявок во фракцию сейчас нет.")
-        return
-    lines = ["📋 <b>Активные заявки во фракции:</b>\n"]
-    for a in pending[:20]:
-        lines.append(f"• <b>{esc(a['name'])}</b> (<code>#{a['game_id']}</code>) -> <code>{esc(a['faction'])}</code> | <code>/faccept {a['game_id']}</code>")
-    await safe_answer(message, "\n".join(lines), parse_mode="HTML")
-
-
-@dp.message(Command("faccept"))
-async def cmd_faccept(message: Message, bot: Bot):
-    uid = message.from_user.id
-    actor = get_player(uid, message.from_user.full_name)
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await safe_answer(message, "Формат: <code>/faccept &lt;игровой_ID&gt;</code>", parse_mode="HTML")
-        return
-    gid = int(parts[1])
-    target = find_player_by_game_id(gid)
-    if not target:
-        await safe_answer(message, "Игрок не найден.")
-        return
-    fid = actor.get("faction") if actor.get("faction") in FACTIONS else None
-    for a in faction_apps.values():
-        if isinstance(a, dict) and int(a.get("uid", 0)) == int(target["tg_id"]) and a.get("status") == "pending":
-            if fid is None or a.get("faction") == fid:
-                fid = a.get("faction")
-                a["status"] = "accepted"
-                break
-    if not fid or fid not in FACTIONS:
-        await safe_answer(message, "Заявка для вашей фракции не найдена.")
-        return
-    if not (actor.get("faction") == fid and (actor.get("leader_of") == fid or int(actor.get("rank", 1)) >= 10) or is_admin(uid, 7)):
-        await safe_answer(message, "⛔ Недостаточно прав.")
-        return
-    target["faction"] = fid
-    target["rank"] = 1
-    target["f_warns"] = 0
-    target["faction_points"] = 0
-    save_state()
-    await safe_answer(message, f"✅ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) принят в <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
-    await safe_send(bot, int(target["tg_id"]), f"🎉 Вы приняты во фракцию <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
-
-
-@dp.message(Command("fdecline"))
-async def cmd_fdecline(message: Message, bot: Bot):
-    uid = message.from_user.id
-    actor = get_player(uid, message.from_user.full_name)
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await safe_answer(message, "Формат: <code>/fdecline &lt;игровой_ID&gt;</code>", parse_mode="HTML")
-        return
-    gid = int(parts[1])
-    target = find_player_by_game_id(gid)
-    if not target:
-        await safe_answer(message, "Игрок не найден.")
-        return
-    changed = False
-    for a in faction_apps.values():
-        if isinstance(a, dict) and int(a.get("uid", 0)) == int(target["tg_id"]) and a.get("status") == "pending":
-            fid = a.get("faction")
-            if (actor.get("faction") == fid and (actor.get("leader_of") == fid or int(actor.get("rank", 1)) >= 10)) or is_admin(uid, 7):
-                a["status"] = "declined"
-                changed = True
-    if not changed:
-        await safe_answer(message, "Активная заявка не найдена или нет прав.")
-        return
-    save_state()
-    await safe_answer(message, f"❌ Заявка игрока <code>#{gid}</code> отклонена.", parse_mode="HTML")
-    await safe_send(bot, int(target["tg_id"]), "❌ Ваша заявка во фракцию отклонена.", parse_mode="HTML")
+    await safe_answer(message, f"🏦 Казна фракции пополнена на <b>+{amount} ₽</b>. Текущая казна: <b>{fs['treasury']} ₽</b>.", parse_mode="HTML")
 
 
 @dp.message(Command("fwarn"))
 async def cmd_fwarn(message: Message, bot: Bot):
     uid = message.from_user.id
     actor = get_player(uid, message.from_user.full_name)
+    actor_fac = actor.get("leader_of") or (actor.get("faction") if int(actor.get("rank", 1)) >= 11 else None)
+
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 2 or not parts[1].isdigit():
         await safe_answer(message, "Формат: <code>/fwarn &lt;игровой_ID&gt; [причина]</code>", parse_mode="HTML")
         return
-    gid = int(parts[1])
+
+    target_gid = int(parts[1])
     reason = parts[2].strip() if len(parts) == 3 and parts[2].strip() else "Нарушение устава фракции"
-    target = find_player_by_game_id(gid)
+    target = find_player_by_game_id(target_gid)
     if not target:
-        await safe_answer(message, "Игрок не найден.")
+        await safe_answer(message, f"Игрок <code>#{target_gid}</code> не найден.", parse_mode="HTML")
         return
+
     tfac = target.get("faction", "none")
     if tfac not in FACTIONS:
-        await safe_answer(message, "Игрок не состоит во фракции.")
+        await safe_answer(message, "Игрок не состоит ни в одной фракции.")
         return
-    can_warn = is_admin(uid, 7) or (actor.get("faction") == tfac and (actor.get("leader_of") == tfac or int(actor.get("rank", 1)) >= 10))
-    if not can_warn:
-        await safe_answer(message, "⛔ Выдавать выговоры могут руководители фракции (10+ ранг) или админы 7+ ур.")
-        return
+
+    if not is_admin(uid, 7):
+        if not actor_fac or actor_fac != tfac:
+            await safe_answer(message, "⛔ Выдавать выговоры можно только сотрудникам своей фракции (лидерам / 11+ рангам или админам 7+).")
+            return
+        if int(actor.get("tg_id", 0)) == int(target.get("tg_id", 0)):
+            await safe_answer(message, "Нельзя выдать выговор самому себе.")
+            return
+
     warns = int(target.get("f_warns", 0)) + 1
+    fac_title = FACTIONS[tfac]["name"]
+    t_uid = int(target["tg_id"])
+
     if warns >= 3:
         target["faction"] = "none"
         target["rank"] = 1
         target["f_warns"] = 0
         target["leader_of"] = None
+        target["active_ftask_id"] = None
+        target["active_ftask_ends_at"] = 0.0
         save_state()
-        await safe_answer(message, f"🚫 Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) получил 3/3 выговора и уволен из фракции!", parse_mode="HTML")
-        await safe_send(bot, int(target["tg_id"]), f"🚫 Вы уволены из фракции <b>{esc(FACTIONS[tfac]['name'])}</b> за 3/3 выговоров. Причина последнего: {esc(reason)}", parse_mode="HTML")
+        await safe_answer(
+            message,
+            f"🚫 Игрок <b>{esc(target['name'])}</b> (<code>#{target_gid}</code>) получил <b>3/3 выговор</b> и уволен из фракции «{esc(fac_title)}»!\nПричина: <i>{esc(reason)}</i>",
+            parse_mode="HTML",
+        )
+        await safe_send(bot, t_uid, f"🚫 Вы уволены из фракции <b>«{esc(fac_title)}»</b> за 3/3 выговоров. Причина: {esc(reason)}", parse_mode="HTML")
     else:
         target["f_warns"] = warns
         save_state()
-        await safe_answer(message, f"⚠️ Игроку <b>{esc(target['name'])}</b> (<code>#{gid}</code>) выдан выговор (<code>{warns}/3</code>). Причина: <i>{esc(reason)}</i>", parse_mode="HTML")
-        await safe_send(bot, int(target["tg_id"]), f"⚠️ Вам выдан выговор во фракции <b>{esc(FACTIONS[tfac]['name'])}</b> (<code>{warns}/3</code>). Причина: {esc(reason)}", parse_mode="HTML")
+        await safe_answer(
+            message,
+            f"⚠️ Игроку <b>{esc(target['name'])}</b> (<code>#{target_gid}</code>) выдан выговор фракции <b><code>{warns}/3</code></b>.\nПричина: <i>{esc(reason)}</i>",
+            parse_mode="HTML",
+        )
+        await safe_send(bot, t_uid, f"⚠️ Вы получили выговор во фракции <b>«{esc(fac_title)}»</b> (<code>{warns}/3</code>). Причина: {esc(reason)}", parse_mode="HTML")
+
+
+@dp.message(Command("r"))
+async def cmd_faction_radio(message: Message, bot: Bot):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    fid = p.get("faction", "none")
+    if fid not in FACTIONS:
+        await safe_answer(message, "Вы не состоите во фракции.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await safe_answer(message, "Формат: <code>/r &lt;сообщение&gt;</code>", parse_mode="HTML")
+        return
+    rk_title = get_faction_rank_title(fid, int(p["rank"]))
+    msg_txt = f"📡 <b>[R] [{esc(FACTIONS[fid]['name'])}] {esc(rk_title)} {esc(p['name'])}:</b> {esc(parts[1].strip())}"
+    sent = 0
+    for k, u in users.items():
+        if isinstance(u, dict) and u.get("faction") == fid:
+            try:
+                await safe_send(bot, int(k), msg_txt, parse_mode="HTML")
+                sent += 1
+            except Exception:
+                pass
+    await safe_answer(message, f"✅ Сообщение отправлено в рацию фракции (<code>{sent}</code> сослуживцам).", parse_mode="HTML")
 
 
 @dp.message(Command("setleader"))
@@ -5278,41 +5770,77 @@ async def cmd_setleader(message: Message, bot: Bot):
         await safe_answer(message, "⛔ Назначать лидеров фракций можно с 11 ранга администратора.")
         return
     parts = (message.text or "").split()
-    if len(parts) != 3:
-        f_keys = ", ".join(f"<code>{k}</code>" for k in FACTIONS)
-        await safe_answer(message, f"Формат: <code>/setleader &lt;игровой_ID&gt; &lt;фракция|none&gt;</code>\nФракции: {f_keys}", parse_mode="HTML")
-        return
-    if not parts[1].isdigit():
-        await safe_answer(message, "Игровой ID должен быть числом.")
+    if len(parts) != 3 or not parts[1].isdigit():
+        keys_str = ", ".join(f"<code>{esc(k)}</code>" for k in FACTIONS)
+        await safe_answer(message, f"Формат: <code>/setleader &lt;игровой_ID&gt; &lt;фракция|none&gt;</code>\nФракции: {keys_str}", parse_mode="HTML")
         return
     gid = int(parts[1])
     fid = parts[2].strip().lower()
     target = find_player_by_game_id(gid)
     if not target:
-        await safe_answer(message, "Игрок не найден.")
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
         return
+    t_uid = int(target["tg_id"])
     if fid == "none":
         target["leader_of"] = None
+        target["faction"] = "none"
+        target["rank"] = 1
         save_state()
-        await safe_answer(message, f"✅ Лидерство снято с игрока <b>{esc(target['name'])}</b> (<code>#{gid}</code>).", parse_mode="HTML")
+        await safe_answer(message, f"✅ Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) снят с поста лидера.", parse_mode="HTML")
         return
     if fid not in FACTIONS:
         await safe_answer(message, "Неизвестный ключ фракции.")
         return
     target["faction"] = fid
     target["rank"] = 13
-    target["f_warns"] = 0
     target["leader_of"] = fid
+    target["f_warns"] = 0
     save_state()
-    await safe_answer(message, f"👑 Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) назначен лидером <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
-    await safe_send(bot, int(target["tg_id"]), f"👑 Вы назначены лидером фракции <b>{esc(FACTIONS[fid]['name'])}</b>!", parse_mode="HTML")
+    await safe_answer(message, f"👑 Игрок <b>{esc(target['name'])}</b> (<code>#{gid}</code>) назначен лидером «{esc(FACTIONS[fid]['name'])}» (13 ранг).", parse_mode="HTML")
+    await safe_send(bot, t_uid, f"👑 Вы назначены лидером фракции <b>«{esc(FACTIONS[fid]['name'])}»</b>!", parse_mode="HTML")
+
+
+@dp.message(Command("bank"))
+async def cmd_bank(message: Message):
+    uid = message.from_user.id
+    p = get_player(uid, message.from_user.full_name)
+    parts = (message.text or "").split()
+    if len(parts) != 3 or parts[1].lower() not in {"put", "take"} or not parts[2].isdigit():
+        await safe_answer(
+            message,
+            f"🏦 <b>Банк:</b> наличные <b>{p['money']} ₽</b> | счёт <b>{p['bank']} ₽</b>\n"
+            f"Команды: <code>/bank put &lt;сумма&gt;</code> или <code>/bank take &lt;сумма&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+    action = parts[1].lower()
+    amount = int(parts[2])
+    if amount <= 0:
+        await safe_answer(message, "Сумма должна быть больше нуля.")
+        return
+    if action == "put":
+        if p["money"] < amount:
+            await safe_answer(message, "Недостаточно наличных.")
+            return
+        p["money"] -= amount
+        p["bank"] += amount
+        save_state()
+        await safe_answer(message, f"🏦 Внесено <b>+{amount} ₽</b>. Наличные: <b>{p['money']} ₽</b> | Банк: <b>{p['bank']} ₽</b>.", parse_mode="HTML")
+    else:
+        if p["bank"] < amount:
+            await safe_answer(message, "Недостаточно средств на банковском счёте.")
+            return
+        p["bank"] -= amount
+        p["money"] += amount
+        save_state()
+        await safe_answer(message, f"🏦 Снято <b>{amount} ₽</b>. Наличные: <b>{p['money']} ₽</b> | Банк: <b>{p['bank']} ₽</b>.", parse_mode="HTML")
 
 
 @dp.message(Command("resetplayer"))
 async def cmd_resetplayer(message: Message):
     uid = message.from_user.id
     if not is_admin(uid, 14):
-        await safe_answer(message, "⛔ Обнулять аккаунты можно с 14 ранга администратора.")
+        await safe_answer(message, "⛔ Обнулять аккаунты игроков можно с 14 ранга администратора.")
         return
     parts = (message.text or "").split()
     if len(parts) != 2 or not parts[1].isdigit():
@@ -5321,100 +5849,49 @@ async def cmd_resetplayer(message: Message):
     gid = int(parts[1])
     target = find_player_by_game_id(gid)
     if not target:
-        await safe_answer(message, "Игрок не найден.")
+        await safe_answer(message, f"Игрок <code>#{gid}</code> не найден.", parse_mode="HTML")
         return
-    tg_id = int(target["tg_id"])
-    old_name = target["name"]
-    users[str(tg_id)] = normalize_player({"tg_id": tg_id, "game_id": gid, "name": old_name}, tg_id)
+    t_uid = int(target["tg_id"])
+    if is_creator(t_uid):
+        await safe_answer(message, "Нельзя обнулить создателя.")
+        return
+    fresh = normalize_player({"name": target["name"], "registered": True, "game_id": gid}, t_uid)
+    users[str(t_uid)] = fresh
     save_state()
-    await safe_answer(message, f"♻️ Аккаунт игрока <b>{esc(old_name)}</b> (<code>#{gid}</code>) обнулён.", parse_mode="HTML")
+    await safe_answer(message, f"♻️ Аккаунт игрока <b>{esc(fresh['name'])}</b> (<code>#{gid}</code>) обнулён.", parse_mode="HTML")
 
 
 @dp.message(Command("wipeall"))
 async def cmd_wipeall(message: Message):
     uid = message.from_user.id
     if not is_creator(uid):
-        await safe_answer(message, "⛔ Полный вайп доступен только создателю проекта.")
+        await safe_answer(message, "⛔ Полный вайп данных доступен только создателю проекта.")
         return
     parts = (message.text or "").split()
     if len(parts) != 2 or parts[1] != "CONFIRM":
-        await safe_answer(message, "⚠️ Для полного вайпа введите: <code>/wipeall CONFIRM</code>", parse_mode="HTML")
+        await safe_answer(message, "⚠️ Опасная команда! Для полного вайпа введите: <code>/wipeall CONFIRM</code>", parse_mode="HTML")
         return
-    global next_ticket_id
     users.clear()
     faction_apps.clear()
     families.clear()
     promocodes.clear()
     support_tickets.clear()
-    next_ticket_id = 1
+    for b in businesses.values():
+        b["owner_uid"] = None
+        b["owner_name"] = None
+        b["cash"] = 0
+        b["last_collect"] = 0.0
     for fid, fdef in DEFAULT_FACTION_STATE.items():
         faction_state[fid] = dict(fdef)
-    for bid, bdef in DEFAULT_BUSINESSES.items():
-        businesses[bid] = dict(bdef)
     save_state()
-    await safe_answer(message, "🧹 Выполнен полный вайп данных сервера (кроме нумерации игровых ID).")
-
-
-@dp.message(Command("bank"))
-async def cmd_bank(message: Message):
-    uid = message.from_user.id
-    p = get_player(uid, message.from_user.full_name)
-    parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[2].isdigit():
-        await safe_answer(message, "Формат: <code>/bank put &lt;сумма&gt;</code> или <code>/bank take &lt;сумма&gt;</code>", parse_mode="HTML")
-        return
-    action = parts[1].lower()
-    amt = int(parts[2])
-    if amt <= 0:
-        await safe_answer(message, "Сумма должна быть больше нуля.")
-        return
-    if action == "put":
-        if p["money"] < amt:
-            await safe_answer(message, "Недостаточно наличных.")
-            return
-        p["money"] -= amt
-        p["bank"] += amt
-        save_state()
-        await safe_answer(message, f"🏦 Внесено на счёт: <b>+{amt} ₽</b>. Банк: <b>{p['bank']} ₽</b>.", parse_mode="HTML")
-    elif action == "take":
-        if p["bank"] < amt:
-            await safe_answer(message, "Недостаточно средств на банковском счёте.")
-            return
-        p["bank"] -= amt
-        p["money"] += amt
-        save_state()
-        await safe_answer(message, f"💵 Снято со счёта: <b>+{amt} ₽</b>. Наличные: <b>{p['money']} ₽</b>.", parse_mode="HTML")
-    else:
-        await safe_answer(message, "Используйте <code>put</code> или <code>take</code>.", parse_mode="HTML")
-
-
-@dp.message(F.text == "🏆 Топ-10")
-@dp.message(Command("top"))
-async def btn_top(message: Message):
-    uid = message.from_user.id
-    get_player(uid, message.from_user.full_name)
-    players = []
-    for k, u in users.items():
-        if isinstance(u, dict):
-            try:
-                tg_id = int(u.get("tg_id") or k)
-            except ValueError:
-                continue
-            p_norm = normalize_player(u, tg_id)
-            net_worth = int(p_norm.get("money", 0)) + int(p_norm.get("bank", 0))
-            players.append((net_worth, int(p_norm.get("lvl", 1)), str(p_norm.get("name", "Игрок")), int(p_norm.get("game_id", 0))))
-    players.sort(key=lambda x: (-x[0], -x[1]))
-    lines = ["🏆 <b>Топ-10 богатейших игроков Criminal Russia:</b>\n"]
-    for idx, (nw, lvl, nm, gid) in enumerate(players[:10], start=1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"<code>{idx}.</code>")
-        lines.append(f"{medal} <b>{esc(nm)}</b> (<code>#{gid}</code>, {lvl} ур.) — <b>{nw} ₽</b>")
-    await safe_answer(message, "\n".join(lines), reply_markup=main_kb(uid), parse_mode="HTML")
+    await safe_answer(message, "🧹 Все игровые данные обнулены и сохранены.", parse_mode="HTML")
 
 
 async def main() -> None:
-    load_state()
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        raise RuntimeError("Укажите BOT_TOKEN через переменную окружения BOT_TOKEN или в коде.")
+        raise RuntimeError("Укажите BOT_TOKEN в переменных окружения или в файле pixel_3.py")
+    load_state()
+    save_state()
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
