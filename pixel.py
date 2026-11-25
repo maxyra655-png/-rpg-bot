@@ -1817,15 +1817,14 @@ class BanMiddleware:
         if isinstance(event, Message) and event.from_user:
             uid = event.from_user.id
         elif isinstance(event, CallbackQuery) and event.from_user:
-            uid = event.from_user.id
+        uid = event.from_user.id
 
         if uid is not None and not is_creator(uid):
             u = users.get(str(uid))
             if isinstance(u, dict):
                 if u.get("banned"):
                     reason = u.get("ban_reason") or "Нарушение правил сервера"
-                    text = f"🚫 Ваш аккаунт заблокирован.
-Причина: {esc(reason)}"
+                    text = f"🚫 Ваш аккаунт заблокирован.\nПричина: {esc(reason)}"
                     if isinstance(event, Message):
                         await safe_answer(event, text, parse_mode="HTML")
                     elif isinstance(event, CallbackQuery):
