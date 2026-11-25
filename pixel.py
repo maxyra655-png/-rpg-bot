@@ -1817,7 +1817,7 @@ class BanMiddleware:
         if isinstance(event, Message) and event.from_user:
             uid = event.from_user.id
         elif isinstance(event, CallbackQuery) and event.from_user:
-        uid = event.from_user.id
+            uid = event.from_user.id
 
         if uid is not None and not is_creator(uid):
             u = users.get(str(uid))
@@ -1837,10 +1837,8 @@ class BanMiddleware:
                         rem_txt = format_duration(tb_until - now_ts)
                         tb_reason = u.get("tempban_reason") or "Нарушение правил сервера"
                         text = (
-                            f"⏳ Ваш аккаунт временно заблокирован.
-"
-                            f"Осталось: <b>{esc(rem_txt)}</b>
-"
+                            f"⏳ Ваш аккаунт временно заблокирован.\n"
+                            f"Осталось: <b>{esc(rem_txt)}</b>\n"
                             f"Причина: {esc(tb_reason)}"
                         )
                         if isinstance(event, Message):
